@@ -13,12 +13,13 @@ export async function previewPlugin(checkout: string, reviewer: string) {
   const reactPath = createRequire(resolve(root, 'package.json')).resolve('react')
   const runtime = (await Bun.file(new URL('./runtime.js', import.meta.url)).text())
     .replace("from 'react'", 'from ' + JSON.stringify(reactPath))
+    .replace("from './values'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'values.ts')))
     .replace("'__PREVIEW_ORIGIN__'", JSON.stringify(origin))
   const plugin: BunPlugin = {
     name: 'preview-state',
     setup(build) {
       build.onResolve({ filter: /^preview-runtime$/ }, () => ({ path: 'runtime', namespace: 'preview' }))
-      build.onLoad({ filter: /.*/, namespace: 'preview' }, () => ({ contents: runtime, loader: 'js', resolveDir: root }))
+      build.onLoad({ filter: /.*/, namespace: 'preview' }, () => ({ contents: runtime, loader: 'js', resolveDir: import.meta.dir }))
       build.onLoad({ filter: /\.[jt]sx?$/ }, ({ path }) => {
         const contents = sources.get(path)
         return contents === undefined ? undefined : { contents, loader: path.endsWith('x') ? 'tsx' : 'ts' }

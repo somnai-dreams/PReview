@@ -1,4 +1,5 @@
 import { useState, useLayoutEffect, useRef } from 'react'
+import { accepts, equal, reconcile, restoration } from './values'
 
 // Replaced by the external bundler for this comparison host.
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
@@ -46,50 +47,50 @@ history.go = (delta = 0) => {
 history.back = () => history.go(-1)
 history.forward = () => history.go(1)
 
-function accepts(schema, value, id = schema.root, depth = 0) {
-  if (depth > 100) return false
-  const shape = schema.nodes[id]
-  switch (shape.kind) {
-    case 'reject': return false
-    case 'primitive': return typeof value === shape.name && (shape.name !== 'number' || Number.isFinite(value))
-    case 'literal': return value === shape.value
-    case 'union': return shape.members.some(member => accepts(schema, value, member, depth + 1))
-    case 'array': return Array.isArray(value) && value.every(item => accepts(schema, item, shape.item, depth + 1))
-    case 'set': return value instanceof Set && [...value].every(item => accepts(schema, item, shape.item, depth + 1))
-    case 'object': {
-      if (value === null || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return false
-      for (const field of shape.fields) {
-        if (!Object.hasOwn(value, field.name) && field.optional) continue
-        if (!accepts(schema, value[field.name], field.shape, depth + 1)) return false
-      }
-      for (const key of Object.keys(value)) {
-        if (shape.fields.some(field => field.name === key)) continue
-        if (shape.index === null || !accepts(schema, value[key], shape.index, depth + 1)) return false
-      }
-      return true
+function observe(cell) {
+  useLayoutEffect(() => {
+    let instances = cells.get(cell.id)
+    if (instances === undefined) { instances = []; cells.set(cell.id, instances) }
+    instances.push(cell)
+    return () => {
+      const index = instances.indexOf(cell)
+      if (index !== -1) instances.splice(index, 1)
+      if (instances.length === 0) cells.delete(cell.id)
     }
-  }
+  }, [])
 }
 
 export function useObservedState(id, schema, initial) {
   const [value, setter] = useState(() => {
-    const saved = pending?.values.find(cell => cell.id === id)
-    if (saved !== undefined && accepts(schema, saved.value)) return structuredClone(saved.value)
+    const saved = pending?.values.find(cell => cell.id === id && cell.kind === 'state')
+    if (saved !== undefined && accepts(schema, saved.value)) return reconcile(saved.value, undefined, pending.context)
     return typeof initial === 'function' ? initial() : initial
   })
-  const token = useRef({ id, schema, value, setter })
-  useLayoutEffect(() => {
-    token.current.value = value
-    let instances = cells.get(id)
-    if (instances === undefined) { instances = []; cells.set(id, instances) }
-    if (!instances.includes(token.current)) instances.push(token.current)
-    return () => {
-      const index = instances.indexOf(token.current)
-      if (index !== -1) instances.splice(index, 1)
-      if (instances.length === 0) cells.delete(id)
-    }
-  }, [value])
+  const [, refresh] = useState(0)
+  const token = useRef({ id, schema, kind: 'state', value,
+    read() { return this.value },
+    write(next) { setter(() => next); refresh(value => value + 1) },
+  })
+  useLayoutEffect(() => { token.current.value = value })
+  observe(token.current)
   return [value, setter]
+}
+
+export function useObservedRef(id, schema, initial) {
+  const ref = useRef(initial)
+  const [, refresh] = useState(0)
+  const mounted = useRef(false)
+  if (!mounted.current && pending !== null) {
+    const saved = pending.values.find(cell => cell.id === id && cell.kind === 'ref')
+    if (saved !== undefined && accepts(schema, saved.value)) ref.current = reconcile(saved.value, ref.current, pending.context)
+  }
+  useLayoutEffect(() => { mounted.current = true }, [])
+  const token = useRef({ id, schema, kind: 'ref',
+    read: () => ref.current,
+    write(next) { ref.current = next; refresh(value => value + 1) },
+  })
+  observe(token.current)
+  return ref
 }
 
 function capture() {
@@ -97,12 +98,13 @@ function capture() {
   for (const [id, instances] of cells) {
     if (instances.length !== 1) { skipped.push({ id, reason: 'multiple instances', count: instances.length }); continue }
     const cell = instances[0]
-    if (!accepts(cell.schema, cell.value)) {
+    const value = cell.read()
+    if (!accepts(cell.schema, value)) {
       const root = cell.schema.nodes[cell.schema.root]
       skipped.push({ id, reason: root.kind === 'reject' ? root.reason : 'unsupported value or type' })
       continue
     }
-    values.push({ id, value: structuredClone(cell.value) })
+    values.push({ id, kind: cell.kind, value })
   }
   const scroll = []
   const elements = [...document.querySelectorAll('[id]')]
@@ -121,16 +123,8 @@ function capture() {
     }
     scroll.push({ id: element.id, top: element.scrollTop, left: element.scrollLeft, anchor })
   }
-  return { values, skipped, scroll, history: structuredClone(navigation) }
-}
-
-function equal(a, b) {
-  if (Object.is(a, b)) return true
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
-  if (a instanceof Set || b instanceof Set) return a instanceof Set && b instanceof Set && a.size === b.size && [...a].every(value => [...b].some(other => equal(value, other)))
-  if (Array.isArray(a) !== Array.isArray(b)) return false
-  const keys = Object.keys(a)
-  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && equal(a[key], b[key]))
+  // Clone the complete graph once, retaining shared references across cells.
+  return structuredClone({ values, skipped, scroll, history: navigation })
 }
 
 const paint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
@@ -140,32 +134,45 @@ async function restore(snapshot) {
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances === undefined) { absent.push(saved.id); continue }
-    if (instances.length !== 1 || !accepts(instances[0].schema, saved.value)) { rejected.push(saved.id); continue }
+    if (instances.length !== 1 || instances[0].kind !== saved.kind || !accepts(instances[0].schema, saved.value)
+      || saved.kind === 'ref' && !accepts(instances[0].schema, instances[0].read())) { rejected.push(saved.id); continue }
     restored.push(saved.id)
   }
   if (rejected.length > 0) return { restored: [], rejected, absent, current: capture() }
-  pending = snapshot
-  for (const saved of snapshot.values) {
-    if (restored.includes(saved.id)) cells.get(saved.id)[0].setter(() => structuredClone(saved.value))
+  pending = { values: snapshot.values, context: restoration() }
+  function applyValues() {
+    // Ref containers establish destination identities before state that may
+    // point into the same graph. Native setters then schedule rendering.
+    pending.context = restoration()
+    for (const kind of ['ref', 'state']) {
+      for (const saved of snapshot.values) {
+        if (saved.kind !== kind) continue
+        const instances = cells.get(saved.id)
+        if (instances === undefined || instances.length !== 1) continue
+        const cell = instances[0]
+        if (cell.kind !== kind || !accepts(cell.schema, saved.value) || kind === 'ref' && !accepts(cell.schema, cell.read())) {
+          if (!rejected.includes(saved.id)) rejected.push(saved.id)
+          continue
+        }
+        const next = reconcile(saved.value, kind === 'ref' ? cell.read() : undefined, pending.context)
+        cell.write(next)
+        if (!restored.includes(saved.id)) restored.push(saved.id)
+      }
+    }
   }
+  try {
+  applyValues()
   navigation = structuredClone(snapshot.history)
   const target = navigation.entries[navigation.index]
   nativeReplace(target.state, '', target.path)
   await paint()
   // Native route changes mount components and run their normal reset effects.
   // Restore the checkpoint after that mount, including state newly discovered there.
-  const secondPass = []
-  for (const saved of snapshot.values) {
+  const secondPass = snapshot.values.filter(saved => {
     const instances = cells.get(saved.id)
-    if (instances === undefined || instances.length !== 1) continue
-    const cell = instances[0]
-    if (!accepts(cell.schema, saved.value)) { rejected.push(saved.id); continue }
-    if (!equal(cell.value, saved.value)) {
-      cell.setter(() => structuredClone(saved.value))
-      secondPass.push(saved.id)
-    }
-    if (!restored.includes(saved.id)) restored.push(saved.id)
-  }
+    return instances?.length === 1 && !equal(instances[0].read(), saved.value)
+  }).map(saved => saved.id)
+  applyValues()
   await paint()
   const scrollRestored = []
   for (const saved of snapshot.scroll) {
@@ -186,13 +193,13 @@ async function restore(snapshot) {
     scrollRestored.push({id:saved.id,method})
   }
   await paint()
-  pending = null
   const current = capture()
   const changed = snapshot.values.filter(saved => {
     const actual = current.values.find(cell => cell.id === saved.id)
     return actual !== undefined && !equal(saved.value, actual.value)
   }).map(cell => cell.id)
   return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, current }
+  } finally { pending = null }
 }
 
 globalThis.__preview = { capture, restore }
@@ -213,7 +220,7 @@ addEventListener('message', async event => {
       // without naming an app module, field, route, or feature.
       const owners=[]
       for(const instances of cells.values()) {
-        if(instances.length===1&&accepts(instances[0].schema,instances[0].value)&&equal(instances[0].value,history.state))owners.push(instances[0])
+        if(instances.length===1&&instances[0].kind==='state'&&accepts(instances[0].schema,instances[0].read())&&equal(instances[0].read(),history.state))owners.push(instances[0])
       }
       if(owners.length!==1||!accepts(owners[0].schema,target.state)){result={navigated:false};break}
       navigation=structuredClone(journal)

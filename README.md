@@ -17,6 +17,8 @@ bun demo
 
 Open **http://localhost:4510**. Edit the draft, change the tone, increment the count, or open the details and enter a note. Switch between the two build buttons; those values should travel with you. Continue editing and switch back.
 
+The ref controls also exercise a shared object inside a Map and a memoized consumer of that Map. "Append ref without rendering" changes only the ref; switch builds to see the destination pick up the change. Use `PORT=4610 bun demo` to run a second example on ports 4610–4612.
+
 The self-contained example serves two visual variants of one small React app on ports 4511 and 4512. It needs no account, credentials, external services, or project-specific assets. These variants exercise the integration; they are not a claim of compatibility with every router or application.
 
 ## Use with another application
@@ -61,28 +63,32 @@ This setup is once per application, outside its feature code. Individual PRs nee
 
 ## How state is matched
 
-The compiler reads the checkout's `tsconfig.json` and examines source files under `src/`. It finds ordinary destructured `useState` or `React.useState` calls. Each state cell is identified by its relative source path, owning function, and variable name. Matching identities and destination type validation determine what can transfer.
+The compiler reads the checkout's `tsconfig.json` and examines source files under `src/`. It finds ordinary destructured `useState` calls and named `useRef` bindings, including their `React.*` spellings. Each cell is identified by its relative source path, owning function, and variable name. Matching identities, hook kinds and destination type validation determine what can transfer.
 
 The runtime records mounted values and setters. It skips ambiguous repeated instances, clones accepted values, and restores them through normal React updates. A pending checkpoint also initializes newly mounted observed components. A second pass follows mounting, and the wrapper reports restored, absent, rejected, and changed values.
+
+Refs are read from their current value at capture time, including in-place mutations since the last render. The checkpoint is cloned as one graph to retain shared references. Restoration reuses compatible mutable destination containers and schedules their owners to render, so existing Map references and memoized consumers continue to see changes. Read-only or incompatible containers are replaced. A ref whose type includes unsupported values is kept local even when its current value is null or empty.
 
 No application source or runtime state is uploaded by PReview. State is exchanged directly between the localhost frames and their parent via `postMessage`. Debug snapshots remain accessible in the reviewer's page memory as `window.lastTransfer`.
 
 ## Current limits
 
-- Supports ordinary `useState` values described by supported primitive, literal, union, array, Set and plain-object types. Type compatibility does not prove semantic compatibility across different code.
-- Ref contents, Maps, reducers, external stores, classes, functions, opaque values, files and browser resources are not transferred. Feed data held in refs can therefore differ even when filters and scroll position transfer.
+- Supports `useState` and `useRef` values described by supported primitive, literal, union, array, fixed-tuple, Map, Set and plain-object types, including object intersections and mapped properties. `unknown` fields must pass the same plain-data checks at runtime; `any` remains unsupported. Type compatibility does not prove semantic compatibility across different code.
+- Maps require primitive keys. PReview preserves aliases within the observed graph, but cannot generally repair unobserved closures or memoized values derived from an earlier version of that graph.
+- Reducers, external stores, classes, functions, typed buffers, files and browser resources are not transferred. Cyclic graphs and accessor-backed objects are rejected. Resource-containing refs stay local as a whole; this can also exclude otherwise ordinary data beside a resource.
 - Canvas resources and state declared beside a detected canvas owner stay in their original build. Setters used only inside effects are also excluded by a heuristic.
 - State in repeated instances of the same component is skipped when its identity is ambiguous. Renames and moved declarations change identity. Aliased hook imports and other hook calling conventions are not recognized.
 - Routing currently assumes a unique observed state value corresponding to `history.state` and an app that handles `popstate`. It intercepts History API methods to keep a separate navigation journal for each iframe. This is not a general router adapter and does not preserve arbitrary browser navigation behavior.
 - Scroll restoration handles scroll containers with unique element IDs. It first tries a visible link anchor, then falls back to pixels. It does not make independently loaded feeds identical.
 - Restoration uses frame timing, not application-specific readiness. Async effects may overwrite restored state later. A failed restore can leave the hidden destination partially updated; there is no transaction rollback.
+- Copyable data can still represent a request flag, timer ID or mutation receipt. The observer does not infer all of these meanings from a primitive type. Restore between settled builds; ref support does not move in-flight work or provide execution-state migration.
 - Builds remain mounted, so their effects, network connections and memory use remain active. This is not a suspension mechanism. Bundle generation runs once at startup; hot reload is not implemented.
 
 ## Trust and authentication
 
 Use trusted builds that are allowed to see the same working state. Transferred drafts and other application data become available to the destination build and reviewer. Source/origin checks prevent unrelated windows from participating; they do not make an untrusted build safe.
 
-The compiler excludes filenames containing `auth`, `compliance`, `tracing` or `analytics`. This is a discovery heuristic, **not a guarantee that all sensitive values are excluded**. Inspect the returned `cells` inventory and the application's state before using it with sensitive sessions.
+The compiler excludes filenames containing `auth`, `compliance`, `tracing` or `analytics`. This is a discovery heuristic, **not a guarantee that all sensitive values are excluded**. Inspect the returned `cells` inventory and the application's state before using it with sensitive sessions. Both kinds of observed cell can hold sensitive data; wrapping a ref does not make its value shareable with another account.
 
 PReview does not copy cookies, localStorage or sessionStorage and does not implement sign-in. Existing application authentication still applies. Localhost cookies may already be shared across ports, while origin-scoped storage is separate. The launcher must respect the application's normal authentication boundaries.
 
@@ -93,5 +99,7 @@ bun check
 ```
 
 This runs the compiler regression test, strict TypeScript checks for the TypeScript sources, and linting. The browser runtime and inline host script are JavaScript; the TypeScript check does not cover them. Browser checks remain manual in this initial version.
+
+The value tests cover Map and tuple validation, container identity, shared references, subsequent mutation, and rejection of executable data. See [architecture notes](docs/architecture.md) for the compiler-versus-fiber tradeoff.
 
 The package uses TypeScript 5 for its compiler API and TypeScript 7 for checking. React is used by the example and must resolve from the target application's dependencies when integrating the plugin. This repository is used from source; it is not published to npm.

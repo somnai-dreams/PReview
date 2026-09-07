@@ -1,13 +1,15 @@
 import { resolve } from 'node:path'
 import { previewPlugin } from '../../src/plugin'
 import { startReviewer } from '../../src/host'
+import { localPort } from '../../src/local'
 
 const checkout = import.meta.dir
-const reviewerOrigin = 'http://localhost:4510'
+const hostPort = localPort(process.env['PORT'] ?? '4510')
+const reviewerOrigin = 'http://localhost:' + hostPort
 const { plugin, cells } = await previewPlugin(checkout, reviewerOrigin)
 console.log('Discovered', cells.length, 'state cells')
 
-for (const [variant, port] of [['A', 4511], ['B', 4512]] as const) {
+for (const [variant, port] of [['A', localPort(String(hostPort + 1))], ['B', localPort(String(hostPort + 2))]] as const) {
   const result = await Bun.build({
     entrypoints: [resolve(checkout, 'src/App.tsx')],
     tsconfig: resolve(checkout, 'tsconfig.json'),
@@ -30,4 +32,4 @@ for (const [variant, port] of [['A', 4511], ['B', 4512]] as const) {
   })
 }
 
-startReviewer({ port: 4510, builds: ['http://localhost:4511', 'http://localhost:4512'] })
+startReviewer({ port: hostPort, builds: ['http://localhost:' + (hostPort + 1), 'http://localhost:' + (hostPort + 2)] })
