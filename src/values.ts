@@ -87,7 +87,7 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
 // also check shared-object identity: equal fields with broken aliases differ.
 // knownSource is reserved for previously validated, owned checkpoint data. The
 // live destination still receives descriptor/prototype checks on every visit.
-export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(), reverse = new Map<object, object>(), copies?: Restoration['copies'], knownSource = false): boolean {
+export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(), reverse = new Map<object, object>(), copies?: Restoration['copies'], knownSource = false, added?: object[]): boolean {
   if (Object.is(a, b)) return true
   if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
   const restored = copies?.get(a)
@@ -97,13 +97,14 @@ export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(),
   if (reverse.has(b)) return false
   pairs.set(a, b)
   reverse.set(b, a)
+  added?.push(a)
   if (a instanceof Map || b instanceof Map) {
     if (!(a instanceof Map) || !(b instanceof Map) || Object.getPrototypeOf(a) !== Map.prototype
       || Object.getPrototypeOf(b) !== Map.prototype || Reflect.ownKeys(a).length !== 0 || Reflect.ownKeys(b).length !== 0 || a.size !== b.size) return false
     const other = b.entries()
     for (const [key, value] of a) {
       const item = other.next().value!
-      if (!equal(key, item[0], pairs, reverse, copies, knownSource) || !equal(value, item[1], pairs, reverse, copies, knownSource)) return false
+      if (!equal(key, item[0], pairs, reverse, copies, knownSource, added) || !equal(value, item[1], pairs, reverse, copies, knownSource, added)) return false
     }
     return true
   }
@@ -111,7 +112,7 @@ export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(),
     if (!(a instanceof Set) || !(b instanceof Set) || Object.getPrototypeOf(a) !== Set.prototype
       || Object.getPrototypeOf(b) !== Set.prototype || Reflect.ownKeys(a).length !== 0 || Reflect.ownKeys(b).length !== 0 || a.size !== b.size) return false
     const other = b.values()
-    for (const value of a) if (!equal(value, other.next().value, pairs, reverse, copies, knownSource)) return false
+    for (const value of a) if (!equal(value, other.next().value, pairs, reverse, copies, knownSource, added)) return false
     return true
   }
   if (Array.isArray(a) || Array.isArray(b)) {
@@ -120,7 +121,7 @@ export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(),
     for (let index = 0; index < a.length; index++) {
       const left = knownSource ? { value: a[index], enumerable: true } : Object.getOwnPropertyDescriptor(a, index), right = Object.getOwnPropertyDescriptor(b, index)
       if (left === undefined || right === undefined || !('value' in left) || !('value' in right) || !left.enumerable || !right.enumerable
-        || !equal(left.value, right.value, pairs, reverse, copies, knownSource)) return false
+        || !equal(left.value, right.value, pairs, reverse, copies, knownSource, added)) return false
     }
     return true
   }
@@ -131,9 +132,42 @@ export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(),
     if (typeof key !== 'string') return false
     const left = knownSource ? { value: a[key], enumerable: true } : Object.getOwnPropertyDescriptor(a, key), right = Object.getOwnPropertyDescriptor(b, key)
     if (left === undefined || right === undefined || !('value' in left) || !('value' in right) || !left.enumerable || !right.enumerable
-      || !equal(left.value, right.value, pairs, reverse, copies, knownSource)) return false
+      || !equal(left.value, right.value, pairs, reverse, copies, knownSource, added)) return false
   }
   return true
+}
+
+// One synchronous read phase owns this comparison. Discard it before any app
+// writes/commit; successful shared subgraphs can then be visited just once.
+export function comparison(copies?: Restoration['copies']) {
+  const pairs = new Map<object, object>(), reverse = new Map<object, object>()
+  function matches(source: unknown, current: unknown): boolean {
+    const added: object[] = []
+    if (equal(source, current, pairs, reverse, copies, true, added)) return true
+    // A failed candidate must not leave a half-compared graph in the result.
+    for (const value of added) { reverse.delete(pairs.get(value)!); pairs.delete(value) }
+    return false
+  }
+  return { matches, pairs, reverse }
+}
+
+// Only owned checkpoint copies may enter this cache. Live values always require
+// a fresh comparison or validation. Weak keys do not retain old checkpoints.
+export function checkpointValidation() {
+  const validated = new WeakMap<Schema, WeakSet<object>>()
+  function remember(schema: Schema, value: Value) {
+    if (value === null || typeof value !== 'object') return
+    let values = validated.get(schema)
+    if (values === undefined) { values = new WeakSet(); validated.set(schema, values) }
+    values.add(value)
+  }
+  function acceptsCopy(schema: Schema, value: unknown): value is Value {
+    if (value !== null && typeof value === 'object' && validated.get(schema)?.has(value)) return true
+    if (!accepts(schema, value)) return false
+    remember(schema, value)
+    return true
+  }
+  return { accepts: acceptsCopy, remember }
 }
 
 export type Restoration = { copies: Map<object, { value: Container; pass: number }>; claimed: Set<object>; pass: number }

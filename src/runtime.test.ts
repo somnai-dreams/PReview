@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { runInNewContext } from 'node:vm'
-import { accepts, equal, matchesRestoration, reconcile, restoration, type Schema, type Value } from './values'
+import { accepts, equal, comparison, checkpointValidation, reconcile, restoration, type Schema, type Value } from './values'
 import { retainedCells, encodeValues, decodeValues } from './checkpoint'
 
 const runtimeSource = (await Bun.file(new URL('./runtime.js', import.meta.url)).text())
@@ -17,7 +17,7 @@ const data: Schema = { root: 0, nodes: [{ kind: 'data' }] }
 function harness(afterCommit: (pass: number) => void = () => {}, allowCapture = false) {
   let commits = 0, clones = 0
   const runtime = runInNewContext(runtimeSource + '\n;({restore,capture,full:()=>({...checkpoint.snapshot,id:checkpoint.id,base:null,references:[]}),register:cell=>cells.set(cell.id,[cell])})', {
-    accepts, equal, matchesRestoration, reconcile, restoration, retainedCells, encodeValues, decodeValues, crypto,
+    accepts, equal, comparison, checkpointValidation, reconcile, restoration, retainedCells, encodeValues, decodeValues, crypto,
     history: { state: { route: '/' }, replaceState() {} },
     location: { pathname: '/', search: '', hash: '', origin: 'https://localhost:4511', href: 'https://localhost:4511/' },
     addEventListener() {}, performance, URL, DOMException,
@@ -167,4 +167,54 @@ test('a newly mounted alias uses the retained graph through an actual cloned mes
   expect(aSelected.cell.read()).toBe((aFeed.cell.read() as Value[])[0])
   ;(aSelected.cell.read() as { title: string }).title = 'continued edit'
   expect((aFeed.cell.read() as { title: string }[])[0]!.title).toBe('continued edit')
+})
+
+test('warmed checkpoint validation cannot hide an invalid in-place live ref edit', () => {
+  const a = harness(undefined, true), b = harness(undefined, true)
+  const aFeed = cell('feed', 'ref', { count: 1 }), bFeed = cell('feed', 'ref', { count: 0 })
+  const schema: Schema = { root: 0, nodes: [
+    { kind: 'object', fields: [{ name: 'count', optional: false, shape: 1 }], index: null },
+    { kind: 'primitive', name: 'number' },
+  ] }
+  aFeed.cell.schema = schema; bFeed.cell.schema = schema
+  a.runtime.register(aFeed.cell); b.runtime.register(bFeed.cell)
+  b.runtime.restore(structuredClone(a.runtime.capture()))
+  a.runtime.restore(structuredClone(b.runtime.capture()))
+  const current = aFeed.cell.read() as { count: Value }
+  current.count = 'invalid'
+  expect(a.runtime.capture().values).toEqual([])
+  expect(a.runtime.restore(structuredClone(b.runtime.full())).rejected).toEqual(['feed'])
+})
+
+test('each commit invalidates comparisons of previously retained live data', () => {
+  let mutate = false
+  const aFeed = cell('feed', 'ref', { count: 1 }), aDraft = cell('draft', 'state', 'initial')
+  const a = harness(() => { if (mutate) (aFeed.cell.read() as { count: number }).count++ }, true)
+  const b = harness(undefined, true)
+  const bFeed = cell('feed', 'ref', { count: 0 }), bDraft = cell('draft', 'state', '')
+  a.runtime.register(aFeed.cell); a.runtime.register(aDraft.cell)
+  b.runtime.register(bFeed.cell); b.runtime.register(bDraft.cell)
+  b.runtime.restore(structuredClone(a.runtime.capture()))
+  bDraft.reset('edited')
+  mutate = true
+  const report = a.runtime.restore(structuredClone(b.runtime.capture()))
+  expect(report.retained).toBe(1)
+  expect(report.secondPass).toEqual(['feed'])
+  expect(report.changed).toEqual(['feed'])
+  expect(aFeed.writes()).toBe(1)
+  expect(aDraft.cell.read()).toBe('edited')
+})
+
+test('verification does not rescan a settled graph when no repair commit occurred', () => {
+  let reads = 0
+  const observed = new Proxy({ count: 1 }, { ownKeys(target) { reads++; return Reflect.ownKeys(target) } })
+  const feed = cell('feed', 'ref', observed)
+  const { runtime } = harness(() => { reads = 0 })
+  runtime.register(feed.cell)
+  const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
+    { id: 'feed', kind: 'ref', value: { count: 2 } },
+  ] })
+  expect(report.secondPass).toEqual([])
+  expect(report.changed).toEqual([])
+  expect(reads).toBe(1)
 })

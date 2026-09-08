@@ -1,11 +1,12 @@
 import { useState, useLayoutEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
-import { accepts, equal, matchesRestoration, reconcile, restoration } from './values'
+import { accepts, equal, comparison, checkpointValidation, reconcile, restoration } from './values'
 import { retainedCells, encodeValues, decodeValues } from './checkpoint'
 
 // Replaced by the external bundler for this comparison host.
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
 const cells = new Map()
+const validation = checkpointValidation()
 let markMounted
 const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
@@ -69,7 +70,7 @@ function observe(cell) {
 export function useObservedState(id, schema, initial) {
   const [value, setter] = useState(() => {
     const saved = pending?.values.find(cell => cell.id === id && cell.kind === 'state')
-    if (saved !== undefined && accepts(schema, saved.value)) return reconcile(saved.value, undefined, pending.context)
+    if (saved !== undefined && validation.accepts(schema, saved.value)) return reconcile(saved.value, undefined, pending.context)
     return typeof initial === 'function' ? initial() : initial
   })
   const [, refresh] = useState(0)
@@ -88,7 +89,7 @@ export function useObservedRef(id, schema, initial) {
   const mounted = useRef(false)
   if (!mounted.current && pending !== null) {
     const saved = pending.values.find(cell => cell.id === id && cell.kind === 'ref')
-    if (saved !== undefined && accepts(schema, saved.value) && accepts(schema, ref.current)) ref.current = reconcile(saved.value, ref.current, pending.context)
+    if (saved !== undefined && validation.accepts(schema, saved.value) && accepts(schema, ref.current)) ref.current = reconcile(saved.value, ref.current, pending.context)
   }
   useLayoutEffect(() => { mounted.current = true }, [])
   const token = useRef({ id, schema, kind: 'ref',
@@ -115,7 +116,8 @@ function capture() {
     if (instances.length !== 1) { skipped.push({ id, reason: 'multiple instances', count: instances.length }); continue }
     const cell = instances[0]
     const value = cell.read()
-    if (!retained.has(id) && !accepts(cell.schema, value)) {
+    const matched = reverse.get(value)
+    if (!retained.has(id) && !(matched === undefined ? accepts(cell.schema, value) : validation.accepts(cell.schema, matched))) {
       const root = cell.schema.nodes[cell.schema.root]
       skipped.push({ id, reason: root.kind === 'reject' ? root.reason : 'unsupported value or type' })
       continue
@@ -151,6 +153,7 @@ function capture() {
   const encodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: encoded.values[index] }]))
   const entries = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, reuse: true } : encodedById.get(saved.id))
   snapshot.values = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, value: priorValues.get(saved.id).value } : changed.get(saved.id))
+  for (const saved of snapshot.values) validation.remember(owners.get(saved.id).schema, saved.value)
   snapshot.captureMs = performance.now() - started
   snapshot.comparisonMs = comparisonMs
   const base = checkpoint?.id ?? null, id = crypto.randomUUID()
@@ -180,16 +183,17 @@ function restore(packet) {
   for (const [id, instances] of cells) {
     if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
   }
-  const { retained, matches } = reused.size === 0 ? { retained: new Set(), matches: new Map() } : retainedCells(
+  const { retained, matches, reverse } = reused.size === 0 ? { retained: new Set(), matches: new Map(), reverse: new Map() } : retainedCells(
     values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? checkpoint.owners.get(saved.id) : saved })), candidates)
   const restored = [], rejected = [], absent = [], plan = []
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances === undefined) { absent.push(saved.id); continue }
     if (retained.has(saved.id)) { restored.push(saved.id); continue }
+    const current = instances[0].read(), matched = reverse.get(current)
     const validatedBefore = reused.has(saved.id) && checkpoint.owners.get(saved.id) === instances[0]
-    if (instances.length !== 1 || instances[0].kind !== saved.kind || !validatedBefore && !accepts(instances[0].schema, saved.value)
-      || saved.kind === 'ref' && !accepts(instances[0].schema, instances[0].read())) { rejected.push(saved.id); continue }
+    if (instances.length !== 1 || instances[0].kind !== saved.kind || !validatedBefore && !validation.accepts(instances[0].schema, saved.value)
+      || saved.kind === 'ref' && !(matched === undefined ? accepts(instances[0].schema, current) : validation.accepts(instances[0].schema, matched))) { rejected.push(saved.id); continue }
     plan.push({ saved, cell: instances[0] })
     restored.push(saved.id)
   }
@@ -214,15 +218,15 @@ function restore(packet) {
   nativeReplace(target.state, '', target.path)
   // Mount/reset effects can introduce owners or change restored values. Repair
   // only those cells, preserving the graph identities established above.
-  const repairs = []
+  const repairs = [], repairComparison = comparison(pending.context.copies)
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances === undefined) continue
     if (instances.length !== 1 || instances[0].kind !== saved.kind) { rejected.push(saved.id); continue }
     const cell = instances[0]
     const known = retained.has(saved.id) && checkpoint.owners.get(saved.id) === cell || plan.some(entry => entry.saved === saved && entry.cell === cell)
-    if (!known && !accepts(cell.schema, saved.value)) { rejected.push(saved.id); continue }
-    if (matchesRestoration(saved.value, cell.read(), pending.context)) {
+    if (!known && !validation.accepts(cell.schema, saved.value)) { rejected.push(saved.id); continue }
+    if (repairComparison.matches(saved.value, cell.read())) {
       if (!restored.includes(saved.id)) restored.push(saved.id)
       continue
     }
@@ -230,12 +234,20 @@ function restore(packet) {
     repairs.push({ saved, cell })
   }
   const secondPass = repairs.map(entry => entry.saved.id)
-  if (rejected.length === 0 && repairs.length > 0) {
+  const repaired = rejected.length === 0 && repairs.length > 0
+  if (repaired) {
     pending.context.pass++
     flushSync(() => applyValues(repairs))
     for (const { saved } of repairs) if (!restored.includes(saved.id)) restored.push(saved.id)
   }
   const secondCommit = performance.now()
+  // A commit can change any live cell. Without one, this is still the same
+  // synchronous read phase: reuse its comparisons before touching scroll.
+  const changed = [], verification = repaired ? comparison(pending.context.copies) : repairComparison
+  for (const saved of snapshot.values) {
+    const instances = cells.get(saved.id)
+    if (instances?.length === 1 && !verification.matches(saved.value, instances[0].read())) changed.push(saved.id)
+  }
   const scrollRestored = []
   for (const saved of snapshot.scroll) {
     const element = document.getElementById(saved.id)
@@ -253,13 +265,6 @@ function restore(packet) {
     }
     element.scrollTo(saved.left, top)
     scrollRestored.push({id:saved.id,method})
-  }
-  // Compare live cells directly. Verification neither clones the destination
-  // checkpoint nor includes application values in the acknowledgement.
-  const changed = []
-  for (const saved of snapshot.values) {
-    const instances = cells.get(saved.id)
-    if (instances?.length === 1 && !matchesRestoration(saved.value, instances[0].read(), pending.context)) changed.push(saved.id)
   }
   if (rejected.length === 0) checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
   return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,

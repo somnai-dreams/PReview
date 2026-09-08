@@ -1,5 +1,44 @@
 import { expect, test } from 'bun:test'
-import { accepts, equal, matchesRestoration, reconcile, restoration, type Schema } from './values'
+import { accepts, equal, comparison, checkpointValidation, matchesRestoration, reconcile, restoration, type Schema } from './values'
+
+test('one comparison phase reads shared data once and a fresh phase sees mutation', () => {
+  let reads = 0
+  const source = { count: 1 }, live = { count: 1 }
+  const observed = new Proxy(live, { ownKeys(target) { reads++; return Reflect.ownKeys(target) } })
+  const phase = comparison()
+  expect(phase.matches([source], [observed])).toBe(true)
+  const firstReads = reads
+  expect(phase.matches(source, observed)).toBe(true)
+  expect(reads).toBe(firstReads)
+  live.count = 2
+  expect(comparison().matches(source, observed)).toBe(false)
+})
+
+test('a failed comparison discards partial mappings but keeps earlier successful aliases', () => {
+  const source = { count: 1 }, live = { count: 1 }, failed = { count: 2 }
+  const phase = comparison()
+  expect(phase.matches(source, live)).toBe(true)
+  expect(phase.matches({ stable: source, changed: source }, { stable: live, changed: failed })).toBe(false)
+  expect(phase.pairs.size).toBe(1)
+  expect(phase.reverse.size).toBe(1)
+  expect(phase.matches(source, live)).toBe(true)
+  const other = { count: 2 }
+  expect(phase.matches(other, failed)).toBe(true)
+  expect(phase.matches({ count: 2 }, failed)).toBe(false)
+})
+
+test('checkpoint validation reuses only the same owned value under the same schema', () => {
+  let reads = 0
+  const copy = new Proxy({ count: 1 }, { ownKeys(target) { reads++; return Reflect.ownKeys(target) } })
+  const schema: Schema = { root: 0, nodes: [{ kind: 'data' }] }
+  const checked = checkpointValidation()
+  expect(checked.accepts(schema, copy)).toBe(true)
+  const firstReads = reads
+  expect(checked.accepts(schema, copy)).toBe(true)
+  expect(reads).toBe(firstReads)
+  expect(checked.accepts({ root: 0, nodes: [{ kind: 'primitive', name: 'number' }] }, copy)).toBe(false)
+  expect(checked.accepts(schema, { count: () => {} })).toBe(false)
+})
 
 test('selective repair reconnects a reset cell to an unchanged shared container', () => {
   const row = { title: 'saved' }

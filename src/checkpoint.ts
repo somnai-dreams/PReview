@@ -1,4 +1,4 @@
-import { equal, type Value } from './values'
+import { comparison, type Value } from './values'
 
 export type Candidate = { id: string; kind: string; value: unknown; owner: object }
 
@@ -7,21 +7,12 @@ export type Candidate = { id: string; kind: string; value: unknown; owner: objec
 // A new cell can then refer into a retained graph without copying that graph.
 export function retainedCells(previous: Candidate[], current: Candidate[]) {
   const before = new Map(previous.map(cell => [cell.id, cell]))
-  const retained = new Set<string>(), matches = new Map<object, object>(), reverse = new Map<object, object>()
+  const retained = new Set<string>(), checked = comparison()
   for (const cell of current) {
     const old = before.get(cell.id)
-    if (old === undefined || old.kind !== cell.kind || old.owner !== cell.owner) continue
-    const pairs = new Map<object, object>()
-    if (!equal(old.value, cell.value, pairs, new Map(), undefined, true)) continue
-    let compatible = true
-    for (const [source, target] of pairs) {
-      if (matches.has(source) && matches.get(source) !== target || reverse.has(target) && reverse.get(target) !== source) { compatible = false; break }
-    }
-    if (!compatible) continue
-    retained.add(cell.id)
-    for (const [source, target] of pairs) { matches.set(source, target); reverse.set(target, source) }
+    if (old !== undefined && old.kind === cell.kind && old.owner === cell.owner && checked.matches(old.value, cell.value)) retained.add(cell.id)
   }
-  return { retained, matches, reverse }
+  return { retained, matches: checked.pairs, reverse: checked.reverse }
 }
 
 type Step = string | number | { kind: 'map-key' | 'map-value' | 'set'; index: number }
