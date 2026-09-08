@@ -16,7 +16,11 @@ A real change invalidates the affected root's proof. That root uses full compari
 
 ## Observation boundary
 
-The build plugin instruments bundled app and dependency property writes. Known unsupported syntax disables acceleration. Detected runtime code generation disables it too, before the marked expression runs. This fallback is deliberately broad: constructing a function or invoking a method named `constructor` can disable it even if that particular operation is harmless.
+The build plugin instruments bundled app and dependency property writes. The preload also intercepts the native Function, AsyncFunction, GeneratorFunction and AsyncGeneratorFunction constructors before application code. It instruments generated parameters and bodies with the same compiler pass, including closures and default parameters. Constructor aliases captured after preload are covered. Empty capability checks and ordinary `.constructor()` calls no longer disable acceleration.
+
+Native construction performs the original argument coercion, syntax validation and CSP checks first. If rewriting is needed, a second native construction receives the rewritten strings. The returned function keeps the original function kind and custom prototype; application data is never proxied. This adds work when functions are created. The parser, source text and intermediate functions are not cached per generated function.
+
+Known unsupported syntax or generated scopes disable acceleration. Detected eval calls disable it before evaluation, preserving direct eval's lexical scope. Parser diagnostics cannot be treated as complete observation. Constructor wrapping and rewritten Function#toString output are observable development-time changes; this is not transparent to every reflective program.
 
 This is not a universal guarantee for arbitrary JavaScript. An aliased dynamic evaluator, foreign script or foreign-realm native method can evade these detectors. Callers must not enable the experiment where mutations can arrive outside the instrumented bundle and observed native methods. The ordinary full comparison remains the authority for those apps. A successful synthetic example is not evidence of complete application coverage.
 
@@ -24,7 +28,7 @@ No React fiber writes, proxy-wrapped application objects, per-feature adapters, 
 
 ## Verification
 
-Tests exercise no-op writes, actual edits, equal object replacement followed by raw-alias writes, array truncation, accessor rejection, ordered collections, shared aliases, rollback of failed candidates, effect-driven repair, lazy restoration, and fallback before dynamic evaluation. The example exposes complete switch timing through destination reveal and a paint boundary. Initial checkpoint creation must be kept separate from warm switches.
+Tests exercise no-op writes, actual edits, equal object replacement followed by raw-alias writes, array truncation, accessor rejection, ordered collections, shared aliases, rollback of failed candidates, effect-driven repair, lazy restoration, and fallback before dynamic evaluation. Generated-function tests cover closures, constructor aliases, default parameters, strict mode, coercion and custom prototype lookup exactly once, async/generator writes, and unsupported scopes. The example exposes complete switch timing through destination reveal and a paint boundary. Initial checkpoint creation must be kept separate from warm switches.
 
 Performance observations from the public reproduction are recorded below after measurement. Index counts are not a browser heap measurement; the index adds per-object storage and has an initial construction cost.
 
@@ -42,3 +46,11 @@ That is a 2.08x median improvement on this small synthetic sample, with no rejec
 Four 20,000-assignment loops took 4.10, 1.40, 1.50 and 1.30 ms with observation, versus 0.30, 0.40, 0.10 and 0.20 ms without it. These measure the loop, not the subsequent React render. A later transfer containing an actual nested feed edit took 365 ms. The destination showed the edited old-alias value, the toggled flag, the typed draft, and `Shared identity: true` in the selection. These results support retained-root reuse, not fast transfer of every mutation.
 
 Each frame still keeps only its current checkpoint. Switching to a build without the matching base requests a full packet, so these two-build warm results do not imply cheap arbitrary three-way cycling.
+
+## Generated-function reproduction (8 September 2026)
+
+The example now has a button that mutates an old row alias inside a runtime-generated closure. In the connected browser, this edit transferred in 323 ms and preserved the selected row's shared identity. Coverage stayed enabled: one function was created and transformed per frame, with zero fallbacks. Before that edit, four warm switches took 23.1, 22.6, 22.7 and 23.0 ms (median 22.85 ms); the initial transfer took 281.1 ms. These are synthetic results, not an application-wide claim.
+
+Reusing the existing TypeScript parser adds a roughly 4.2 MB minified preload, served without compression by this local fixture. Fetching, parsing and evaluating that preload took 191.6 ms and 122.4 ms in the two frames. Generating the small closure took 3.3 ms and 3.2 ms, including both native construction and instrumentation. The diagnostic panel reports cumulative generated-code compilation time and total browser heap when available. Total heap includes the application, checkpoints, retained indexes and transient allocations; it does not isolate parser overhead. A controlled retained-heap measurement is still missing. The parser is retained, but individual generated source strings and ASTs are not kept in a cache.
+
+Launchers place a `preview-preload-start` performance mark immediately before loading the preload. This makes the displayed preload duration include its fetch, parse and evaluation rather than only timing the module body after parsing.

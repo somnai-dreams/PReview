@@ -3,7 +3,7 @@ import ts from 'typescript'
 // Mark the receiver, leaving JavaScript's original write expression intact.
 // This preserves evaluation order, compound/postfix results, destructuring,
 // await/yield and aliases. No application object is wrapped or replaced.
-export function instrumentWrites(path: string, text: string) {
+export function instrumentWrites(path: string, text: string, generatedFunctions = false) {
   const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, path.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
   const targets = new Map<ts.Expression, string | number | null>()
   const opaque: ts.Expression[] = []
@@ -35,7 +35,7 @@ export function instrumentWrites(path: string, text: string) {
       const expression = node.expression
       const name = ts.isIdentifier(expression) ? expression.text : ts.isPropertyAccessExpression(expression) ? expression.name.text
         : ts.isElementAccessExpression(expression) && ts.isStringLiteral(expression.argumentExpression) ? expression.argumentExpression.text : ''
-      if (name === 'eval' || name === 'Function' || name === 'constructor') {
+      if (name === 'eval' || !generatedFunctions && (name === 'Function' || name === 'constructor')) {
         const args = node.arguments
         const body = args?.length === 1 && args[0] !== undefined && ts.isStringLiteral(args[0]) ? ts.createSourceFile('generated.js', args[0].text, ts.ScriptTarget.Latest) : undefined
         const statement = body?.statements.length === 1 ? body.statements[0] : undefined
@@ -43,6 +43,7 @@ export function instrumentWrites(path: string, text: string) {
         if (!lookup) opaque.push(node)
       }
     }
+    if (ts.isWithStatement(node)) unsupported++
     if (ts.isIdentifier(node) && node.text === 'globalThis') {
       const parent = node.parent
       if ((ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent)
@@ -57,7 +58,10 @@ export function instrumentWrites(path: string, text: string) {
     ts.forEachChild(node, visit)
   }
   visit(source)
-  if (shadowedGlobal) return { code: text, sites: 0, unsupported: unsupported + targets.size, opaque: opaque.length }
+  // This parser field is internal to the pinned TypeScript version. Native
+  // Function construction validates generated JS before it reaches this pass.
+  unsupported += (source as ts.SourceFile & { parseDiagnostics: readonly ts.Diagnostic[] }).parseDiagnostics.length
+  if (shadowedGlobal) return { code: text, sites: 0, unsupported: unsupported + targets.size + opaque.length, opaque: opaque.length }
   const wrappers: { start: number; end: number; before: string; after: string }[] = []
   for (const [node, field] of targets) wrappers.push({ start: node.getStart(source), end: node.end, before: 'globalThis.__previewWrites.touch(', after: field === null ? ')' : ',"property",' + JSON.stringify(field) + ')' })
   for (const node of opaque) wrappers.push({ start: node.getStart(source), end: node.end, before: '(globalThis.__previewWrites.unobserved(),', after: ')' })
@@ -74,4 +78,17 @@ export function instrumentWrites(path: string, text: string) {
     previous = position
   }
   return { code: result + text.slice(previous), sites: targets.size, unsupported, opaque: opaque.length }
+}
+
+// Native Function#toString supplies the complete parameter/body syntax. Parse
+// parameters too: default arguments can mutate existing objects before the body.
+export function instrumentGeneratedFunction(text: string) {
+  const transformed = instrumentWrites('generated.js', text, true)
+  if (transformed.unsupported !== 0) return { kind: 'unsupported' as const }
+  if (transformed.code === text) return { kind: 'unchanged' as const }
+  const source = ts.createSourceFile('generated.js', transformed.code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  const fn = source.statements[0]
+  if (source.statements.length !== 1 || fn === undefined || !ts.isFunctionDeclaration(fn) || fn.body === undefined
+    || (source as ts.SourceFile & { parseDiagnostics: readonly ts.Diagnostic[] }).parseDiagnostics.length !== 0) return { kind: 'unsupported' as const }
+  return { kind: 'instrumented' as const, parameters: transformed.code.slice(fn.parameters.pos, fn.parameters.end), body: transformed.code.slice(fn.body.getStart(source) + 1, fn.body.end - 1) }
 }

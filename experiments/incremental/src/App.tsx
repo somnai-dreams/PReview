@@ -5,6 +5,7 @@ declare const BUILD_VARIANT: string
 type Row = { id: number; title: string; selected: boolean; content: string }
 const initial = { rows: Array.from({ length: 20_000 }, (_, id) => ({ id, title: 'Item ' + id, selected: false, content: 'x'.repeat(2048) })) }
 const original = initial.rows[0]!
+const generatedEdit = new Function('row', 'return () => { row.title = "Edited through generated closure" }')(original) as () => void
 function App() {
   const feed = useRef<{rows:Row[]}>(initial)
   const [draft, setDraft] = useState('Draft')
@@ -18,6 +19,7 @@ function App() {
     <button onClick={() => { const started = performance.now(); for (const row of feed.current.rows) { const title = row.title; row.title = title }; setWriteMs(performance.now() - started) }}>Repeat 20,000 same-value writes</button>
     <output>Write loop: {writeMs.toFixed(2)} ms</output>
     <button onClick={() => { original.title = 'Edited through old alias' }}>Edit old alias without rendering</button>
+    <button onClick={generatedEdit}>Edit through generated closure without rendering</button>
     <button onClick={() => { feed.current.rows[0]!.selected = !feed.current.rows[0]!.selected }}>Toggle a nested value without rendering</button>
     <button onClick={() => setRender(value => value + 1)}>Render current values</button>
     <button onClick={() => setSelected(feed.current.rows[0]!)}>Open selected row</button>

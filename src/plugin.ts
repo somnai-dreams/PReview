@@ -58,7 +58,7 @@ export async function previewPlugin(checkout: string, reviewer: string) {
         // so restore writes invalidate the same watches as application writes.
         const internal = (path.startsWith(import.meta.dir + '/') && path !== resolve(import.meta.dir, 'values.ts')) || (path.startsWith(resolve(import.meta.dir, '../experiments/writes') + '/') && !path.endsWith('/controls.tsx'))
         if (!(writes || fast) || internal) return observed === undefined ? undefined : { contents: observed, loader: path.endsWith('x') ? 'tsx' : 'ts' }
-        const transformed = instrumentWrites(path, observed ?? await Bun.file(path).text())
+        const transformed = instrumentWrites(path, observed ?? await Bun.file(path).text(), fast)
         writeCoverage.opaque += transformed.opaque; writeCoverage.modules++; writeCoverage.sites += transformed.sites; writeCoverage.unsupported += transformed.unsupported
         if (path.includes('/node_modules/')) writeCoverage.dependencies++
         return { contents: transformed.code, loader: path.endsWith('x') ? 'tsx' : 'ts' }
