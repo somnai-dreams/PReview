@@ -1,6 +1,6 @@
 import { useState, useLayoutEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
-import { accepts, equal, reconcile, restoration } from './values'
+import { accepts, equal, matchesRestoration, reconcile, restoration } from './values'
 
 // Replaced by the external bundler for this comparison host.
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
@@ -136,50 +136,57 @@ function capture() {
 
 function restore(snapshot) {
   const started = performance.now()
-  const restored = [], rejected = [], absent = []
+  const restored = [], rejected = [], absent = [], plan = []
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances === undefined) { absent.push(saved.id); continue }
     if (instances.length !== 1 || instances[0].kind !== saved.kind || !accepts(instances[0].schema, saved.value)
       || saved.kind === 'ref' && !accepts(instances[0].schema, instances[0].read())) { rejected.push(saved.id); continue }
+    plan.push({ saved, cell: instances[0] })
     restored.push(saved.id)
   }
-  if (rejected.length > 0) return { restored: [], rejected, absent, current: capture() }
+  if (rejected.length > 0) return { restored: [], rejected, absent }
   const validated = performance.now()
   pending = { values: snapshot.values, context: restoration() }
-  function applyValues() {
-    // Ref containers establish destination identities before state that may
-    // point into the same graph. Native setters then schedule rendering.
-    pending.context = restoration()
+  function applyValues(entries) {
+    // Validation precedes this synchronous commit. Refs establish canonical
+    // container identities before state that may point into the same graph.
     for (const kind of ['ref', 'state']) {
-      for (const saved of snapshot.values) {
+      for (const { saved, cell } of entries) {
         if (saved.kind !== kind) continue
-        const instances = cells.get(saved.id)
-        if (instances === undefined || instances.length !== 1) continue
-        const cell = instances[0]
-        if (cell.kind !== kind || !accepts(cell.schema, saved.value) || kind === 'ref' && !accepts(cell.schema, cell.read())) {
-          if (!rejected.includes(saved.id)) rejected.push(saved.id)
-          continue
-        }
-        const next = reconcile(saved.value, kind === 'ref' ? cell.read() : undefined, pending.context)
-        cell.write(next)
-        if (!restored.includes(saved.id)) restored.push(saved.id)
+        cell.write(reconcile(saved.value, kind === 'ref' ? cell.read() : undefined, pending.context))
       }
     }
   }
   try {
-  flushSync(applyValues)
+  flushSync(() => applyValues(plan))
   const firstCommit = performance.now()
   navigation = structuredClone(snapshot.history)
   const target = navigation.entries[navigation.index]
   nativeReplace(target.state, '', target.path)
-  // Native route changes mount components and run their normal reset effects.
-  // Restore the checkpoint after that mount, including state newly discovered there.
-  const secondPass = snapshot.values.filter(saved => {
+  // Mount/reset effects can introduce owners or change restored values. Repair
+  // only those cells, preserving the graph identities established above.
+  const repairs = []
+  for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
-    return instances?.length === 1 && !equal(instances[0].read(), saved.value)
-  }).map(saved => saved.id)
-  flushSync(applyValues)
+    if (instances === undefined) continue
+    if (instances.length !== 1 || instances[0].kind !== saved.kind) { rejected.push(saved.id); continue }
+    const cell = instances[0]
+    const known = plan.some(entry => entry.saved === saved && entry.cell === cell)
+    if (!known && !accepts(cell.schema, saved.value)) { rejected.push(saved.id); continue }
+    if (matchesRestoration(saved.value, cell.read(), pending.context)) {
+      if (!restored.includes(saved.id)) restored.push(saved.id)
+      continue
+    }
+    if (saved.kind === 'ref' && !accepts(cell.schema, cell.read())) { rejected.push(saved.id); continue }
+    repairs.push({ saved, cell })
+  }
+  const secondPass = repairs.map(entry => entry.saved.id)
+  if (rejected.length === 0 && repairs.length > 0) {
+    pending.context.pass++
+    flushSync(() => applyValues(repairs))
+    for (const { saved } of repairs) if (!restored.includes(saved.id)) restored.push(saved.id)
+  }
   const secondCommit = performance.now()
   const scrollRestored = []
   for (const saved of snapshot.scroll) {
@@ -199,12 +206,14 @@ function restore(snapshot) {
     element.scrollTo(saved.left, top)
     scrollRestored.push({id:saved.id,method})
   }
-  const current = capture()
-  const changed = snapshot.values.filter(saved => {
-    const actual = current.values.find(cell => cell.id === saved.id)
-    return actual !== undefined && !equal(saved.value, actual.value)
-  }).map(cell => cell.id)
-  return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, current,
+  // Compare live cells directly. Verification neither clones the destination
+  // checkpoint nor includes application values in the acknowledgement.
+  const changed = []
+  for (const saved of snapshot.values) {
+    const instances = cells.get(saved.id)
+    if (instances?.length === 1 && !matchesRestoration(saved.value, instances[0].read(), pending.context)) changed.push(saved.id)
+  }
+  return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored,
     timing: { validationMs: validated - started, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, verificationMs: performance.now() - secondCommit } }
   } finally { pending = null }
 }
@@ -247,7 +256,7 @@ addEventListener('message', async event => {
       for (const entry of snapshot.history.entries) {
         if (typeof entry.path !== 'string' || new URL(entry.path, location.href).origin !== location.origin) return
       }
-      result = await restore(snapshot)
+      result = restore(snapshot)
       break
     }
     default: return

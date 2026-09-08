@@ -67,7 +67,7 @@ This setup is once per application, outside its feature code. Individual PRs nee
 
 The compiler reads the checkout's `tsconfig.json` and examines source files under `src/`. It finds ordinary destructured `useState` calls and named `useRef` bindings, including their `React.*` spellings. Each cell is identified by its relative source path, owning function, and variable name. Matching identities, hook kinds and destination type validation determine what can transfer.
 
-The runtime records mounted values and setters. It skips ambiguous repeated instances, clones accepted values, and restores them through normal React updates. A pending checkpoint also initializes newly mounted observed components. A second pass follows mounting, and the wrapper reports restored, absent, rejected, and changed values.
+The runtime records mounted values and setters. It skips ambiguous repeated instances, clones accepted values, and restores them through normal React updates. A pending checkpoint also initializes newly mounted observed components. The destination validates one transfer plan, commits it, then repairs only cells changed by mounting or effects. Both passes share the restored object graph, so repaired cells retain aliases to unchanged refs. The acknowledgement contains cell identities, outcomes and timings; it does not recapture or return the destination state.
 
 Refs are read from their current value at capture time, including in-place mutations since the last render. The checkpoint is cloned as one graph to retain shared references. Restoration reuses compatible mutable destination containers and schedules their owners to render, so existing Map references and memoized consumers continue to see changes. Read-only or incompatible containers are replaced. Pure handle refs stay local, including null DOM refs and empty callback arrays. Data containers may include unsupported optional or union branches, but their complete current values must validate at both ends; no fields are stripped.
 
@@ -100,10 +100,10 @@ PReview does not copy cookies, localStorage or sessionStorage and does not imple
 bun check
 ```
 
-This runs the compiler regression test, strict TypeScript checks for the TypeScript sources, and linting. The browser runtime and inline host script are JavaScript; the TypeScript check does not cover them. Browser checks remain manual in this initial version.
+This runs the compiler regression test, strict TypeScript checks for the TypeScript sources, and linting. The browser runtime and inline host script are JavaScript; the TypeScript check does not cover them. Runtime regression tests exercise the actual restore code with controlled commit callbacks, including selective repairs and compact results. Browser checks exercise the real React renderer and remain manual in this initial version.
 
 The value tests cover Map and tuple validation, container identity, shared references, subsequent mutation, and rejection of executable data. See [architecture notes](docs/architecture.md) for the compiler-versus-fiber tradeoff.
 
 The reviewer enables a build after its observer has mounted, reports failed route preparation and runtime errors, and keeps the source visible when destination validation rejects the checkpoint. This initial mount check does not mean all network activity has settled. The programmatic `startReviewer` API takes `builds: [{ url, label }, ...]`; the CLI uses origins as labels.
 
-The package uses TypeScript 5 for its compiler API and TypeScript 7 for checking. React is used by the example and must resolve from the target application's dependencies when integrating the plugin. This repository is used from source; it is not published to npm.
+The package uses TypeScript 5 for its compiler API and TypeScript 7 for checking. React and React DOM resolve from the target application's dependencies when integrating the plugin. This repository is used from source; it is not published to npm.

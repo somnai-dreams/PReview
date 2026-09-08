@@ -1,5 +1,38 @@
 import { expect, test } from 'bun:test'
-import { accepts, equal, reconcile, restoration, type Schema } from './values'
+import { accepts, equal, matchesRestoration, reconcile, restoration, type Schema } from './values'
+
+test('selective repair reconnects a reset cell to an unchanged shared container', () => {
+  const row = { title: 'saved' }
+  const source = new Map([['one', row]])
+  const context = restoration()
+  const destination = reconcile(source, new Map(), context) as Map<string, typeof row>
+  const selected = reconcile(row, undefined, context)
+  expect(selected).toBe(destination.get('one'))
+  expect(matchesRestoration(source, destination, context)).toBe(true)
+  expect(matchesRestoration(row, { title: 'saved' }, context)).toBe(false)
+  context.pass++
+  expect(reconcile(row, { title: 'reset' }, context)).toBe(selected)
+  expect(selected).toBe(destination.get('one'))
+  expect(matchesRestoration(source, destination, context)).toBe(true)
+})
+
+test('selective repair restores in-place changes without replacing shared objects', () => {
+  const source = { row: { title: 'saved' } }
+  const context = restoration()
+  const target = reconcile(source, undefined, context) as typeof source
+  const row = target.row
+  target.row.title = 'mount reset'
+  expect(matchesRestoration(source, target, context)).toBe(false)
+  context.pass++
+  expect(reconcile(source, target, context)).toBe(target)
+  expect(target.row).toBe(row)
+  expect(row.title).toBe('saved')
+  target.row = { title: 'saved' }
+  expect(matchesRestoration(source, target, context)).toBe(false)
+  context.pass++
+  reconcile(source, target, context)
+  expect(target.row).toBe(row)
+})
 
 test('Map and tuple validation checks populated entries, keys and length', () => {
   const schema: Schema = { root: 0, nodes: [
@@ -58,9 +91,11 @@ test('accessors are not evaluated as checkpoint data', () => {
     { kind: 'primitive', name: 'string' },
   ] }
   expect(accepts(schema, value)).toBe(false)
+  expect(equal({ title: 'data' }, value)).toBe(false)
   const array = [0]
   Object.defineProperty(array, '0', { get() { reads++; return 1 } })
   expect(accepts({ root: 0, nodes: [{ kind: 'array', item: 1 }, { kind: 'primitive', name: 'number' }] }, array)).toBe(false)
+  expect(equal([0], array)).toBe(false)
   expect(reads).toBe(0)
 })
 
@@ -79,6 +114,7 @@ test('unknown fields still reject live resources and cyclic graphs', () => {
   expect(accepts(schema, new Map([[{ id: 'one' }, 'value']]))).toBe(false)
   class ResourceMap extends Map<string, number> { callback = () => {} }
   expect(accepts(schema, new ResourceMap())).toBe(false)
+  expect(equal(new Map(), new ResourceMap())).toBe(false)
   expect(accepts(schema, new AbortController())).toBe(false)
   expect(accepts(schema, { callback: () => {} })).toBe(false)
   expect(accepts(schema, { date: new Date() })).toBe(false)

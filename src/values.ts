@@ -10,7 +10,8 @@ export type Shape =
   | { kind: 'object'; fields: { name: string; optional: boolean; shape: number }[]; index: number | null }
 
 export type Schema = { root: number; nodes: Shape[] }
-export type Value = null | undefined | string | number | boolean | Value[] | Set<Value> | Map<Value, Value> | { [key: string]: Value }
+type Container = Value[] | Set<Value> | Map<Value, Value> | { [key: string]: Value }
+export type Value = null | undefined | string | number | boolean | Container
 
 // `unknown` has no narrower static contract. It still must pass the supported
 // data boundary; functions, accessors, DOM nodes and class instances fail it.
@@ -81,42 +82,63 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
 
 // Ordered collection equality matches iteration-visible UI state. The two maps
 // also check shared-object identity: equal fields with broken aliases differ.
-export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(), reverse = new Map<object, object>()): boolean {
+export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(), reverse = new Map<object, object>(), copies?: Restoration['copies']): boolean {
   if (Object.is(a, b)) return true
   if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
+  const restored = copies?.get(a)
+  if (restored !== undefined && restored.value !== b) return false
   const previous = pairs.get(a)
   if (previous !== undefined) return previous === b
   if (reverse.has(b)) return false
   pairs.set(a, b)
   reverse.set(b, a)
   if (a instanceof Map || b instanceof Map) {
-    if (!(a instanceof Map) || !(b instanceof Map) || a.size !== b.size) return false
-    return equal([...a], [...b], pairs, reverse)
+    if (!(a instanceof Map) || !(b instanceof Map) || Object.getPrototypeOf(a) !== Map.prototype
+      || Object.getPrototypeOf(b) !== Map.prototype || a.size !== b.size) return false
+    return equal([...a], [...b], pairs, reverse, copies)
   }
   if (a instanceof Set || b instanceof Set) {
-    if (!(a instanceof Set) || !(b instanceof Set) || a.size !== b.size) return false
-    return equal([...a], [...b], pairs, reverse)
+    if (!(a instanceof Set) || !(b instanceof Set) || Object.getPrototypeOf(a) !== Set.prototype
+      || Object.getPrototypeOf(b) !== Set.prototype || a.size !== b.size) return false
+    return equal([...a], [...b], pairs, reverse, copies)
   }
   if (Array.isArray(a) || Array.isArray(b)) {
-    return Array.isArray(a) && Array.isArray(b) && a.length === b.length
-      && a.every((item: unknown, index: number) => equal(item, b[index], pairs, reverse))
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    for (let index = 0; index < a.length; index++) {
+      const left = Object.getOwnPropertyDescriptor(a, index), right = Object.getOwnPropertyDescriptor(b, index)
+      if (left === undefined || right === undefined || !('value' in left) || !('value' in right)
+        || !equal(left.value, right.value, pairs, reverse, copies)) return false
+    }
+    return true
   }
   if (!plain(a) || !plain(b)) return false
   const keys = Object.keys(a)
-  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && equal(a[key], b[key], pairs, reverse))
+  if (keys.length !== Object.keys(b).length) return false
+  for (const key of keys) {
+    const left = Object.getOwnPropertyDescriptor(a, key), right = Object.getOwnPropertyDescriptor(b, key)
+    if (left === undefined || right === undefined || !('value' in left) || !('value' in right)
+      || !equal(left.value, right.value, pairs, reverse, copies)) return false
+  }
+  return true
 }
 
-export type Restoration = { copies: Map<object, Value>; claimed: Set<object> }
-export function restoration(): Restoration { return { copies: new Map(), claimed: new Set() } }
+export type Restoration = { copies: Map<object, { value: Container; pass: number }>; claimed: Set<object>; pass: number }
+export function restoration(): Restoration { return { copies: new Map(), claimed: new Set(), pass: 0 } }
+
+export function matchesRestoration(source: Value, current: unknown, context: Restoration): boolean {
+  return equal(source, current, new Map(), new Map(), context.copies)
+}
 
 // Reuse mutable destination containers so closures and memoized consumers keep
 // seeing the restored data. One context spans all cells, preserving aliases.
 export function reconcile(source: Value, destination: unknown, context: Restoration): Value {
   if (source === null || typeof source !== 'object') return source
-  if (context.copies.has(source)) return context.copies.get(source)
+  const previousCopy = context.copies.get(source)
+  if (previousCopy !== undefined && previousCopy.pass === context.pass) return previousCopy.value
   const available = destination !== null && typeof destination === 'object' && !context.claimed.has(destination) && !Object.isFrozen(destination)
-  let target: Value
-  if (Array.isArray(source)) target = available && Array.isArray(destination) && Object.isExtensible(destination)
+  let target: Container
+  if (previousCopy !== undefined) target = previousCopy.value
+  else if (Array.isArray(source)) target = available && Array.isArray(destination) && Object.isExtensible(destination)
     && Object.entries(Object.getOwnPropertyDescriptors(destination)).every(([key, field]) => 'value' in field && field.writable && (key === 'length' || field.configurable))
     ? destination : []
   else if (source instanceof Map) target = available && destination instanceof Map ? destination : new Map<Value, Value>()
@@ -124,7 +146,7 @@ export function reconcile(source: Value, destination: unknown, context: Restorat
   else target = available && plain(destination) && Object.isExtensible(destination)
     && Object.values(Object.getOwnPropertyDescriptors(destination)).every(field => 'value' in field && field.writable && field.configurable)
     ? destination as Record<string, Value> : {}
-  context.copies.set(source, target)
+  context.copies.set(source, { value: target, pass: context.pass })
   context.claimed.add(target)
   if (Array.isArray(source) && Array.isArray(target)) {
     for (let i = 0; i < source.length; i++) target[i] = reconcile(source[i], target[i], context)

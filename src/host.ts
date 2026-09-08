@@ -96,7 +96,7 @@ async function swap(index) {
     const result = await call(index, 'restore', snapshot);
     window.lastTransfer = { source: active, destination: index, snapshot, result, milliseconds: performance.now() - started };
     document.querySelector('#details').hidden = false;
-    document.querySelector('#report').textContent = JSON.stringify({ restored: result.restored, absent: result.absent, rejected: result.rejected, changed: result.changed ?? [], keptLocal: snapshot.skipped, timing: { captureMs: snapshot.captureMs, ...result.timing } }, null, 2);
+    document.querySelector('#report').textContent = JSON.stringify({ restored: result.restored, absent: result.absent, rejected: result.rejected, secondPass: result.secondPass ?? [], changed: result.changed ?? [], keptLocal: snapshot.skipped, timing: { captureMs: snapshot.captureMs, ...result.timing } }, null, 2);
     if (result.rejected.length) {
       status.textContent = 'Rejected ' + result.rejected.length + ' incompatible or ambiguous cells; kept source visible';
       return;

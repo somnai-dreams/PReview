@@ -10,9 +10,10 @@ export async function previewPlugin(checkout: string, reviewer: string) {
   const root = resolve(checkout)
   const origin = localOrigin(reviewer)
   const { cells, sources } = prepare(root)
-  const reactPath = createRequire(resolve(root, 'package.json')).resolve('react')
+  const appRequire = createRequire(resolve(root, 'package.json'))
   const runtime = (await Bun.file(new URL('./runtime.js', import.meta.url)).text())
-    .replace("from 'react'", 'from ' + JSON.stringify(reactPath))
+    .replace("from 'react'", 'from ' + JSON.stringify(appRequire.resolve('react')))
+    .replace("from 'react-dom'", 'from ' + JSON.stringify(appRequire.resolve('react-dom')))
     .replace("from './values'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'values.ts')))
     .replace("'__PREVIEW_ORIGIN__'", JSON.stringify(origin))
   const plugin: BunPlugin = {
