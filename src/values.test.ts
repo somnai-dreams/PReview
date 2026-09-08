@@ -171,7 +171,11 @@ test('linear object validation checks required, optional, indexed and hidden fie
   expect(accepts(schema, { title: 'saved' })).toBe(true)
   expect(accepts(schema, {})).toBe(false)
   expect(accepts(schema, { title: 'saved', extra: 1 })).toBe(false)
-  expect(accepts(schema, { title: 'saved', unexpected: 'field' })).toBe(false)
+  expect(accepts(schema, { title: 'saved', added: 'field' })).toBe(true)
+  expect(accepts(schema, { title: 'saved', added: new AbortController() })).toBe(false)
+  expect(accepts(schema, { title: 'saved', added: () => {} })).toBe(false)
+  expect(accepts(schema, Object.defineProperty({ title: 'saved' }, 'added', { get() { throw new Error('Accessor must not run') }, enumerable: true }))).toBe(false)
+  expect(accepts(schema, Object.defineProperty({ title: 'saved' }, 'added', { value: 'hidden' }))).toBe(false)
   expect(accepts(schema, Object.defineProperty({}, 'title', { value: 'hidden' }))).toBe(false)
   schema.nodes[0] = { kind: 'object', fields: [{ name: 'title', optional: false, shape: 1 }], index: 1 }
   expect(accepts(schema, { title: 'saved', other: 'allowed' })).toBe(true)

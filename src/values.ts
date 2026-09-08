@@ -75,8 +75,9 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
       if (value === null || typeof value !== 'object' || !plain(value)) return false
       // Accessor-backed objects are executable state, not plain checkpoint data.
       if (Object.getOwnPropertySymbols(value).length > 0) return false
-      // A closed shape only needs its declared descriptors and a final count.
-      // Avoid constructing and deleting a second object for every data record.
+      // Most records contain only declared fields: validate them without a
+      // descriptor table. TypeScript object types also allow extra properties;
+      // accept those only when they satisfy the plain-data boundary.
       if (shape.index === null) {
         let present = 0
         for (const field of shape.fields) {
@@ -88,7 +89,15 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
             present++
           }
         }
-        return Object.getOwnPropertyNames(value).length === present
+        const keys = Object.getOwnPropertyNames(value)
+        if (keys.length === present) return true
+        const declared = new Set(shape.fields.map(field => field.name))
+        for (const key of keys) {
+          if (declared.has(key)) continue
+          const descriptor = Object.getOwnPropertyDescriptor(value, key)!
+          if (!('value' in descriptor) || !descriptor.enumerable || !accepts(dataSchema, descriptor.value, 0, depth + 1)) return false
+        }
+        return true
       }
       const descriptors = Object.getOwnPropertyDescriptors(value)
       for (const field of shape.fields) {

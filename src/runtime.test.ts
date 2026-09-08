@@ -336,3 +336,20 @@ test('new ambiguity after either commit is reported as a failed restore rather t
     expect(extra.writes()).toBe(0)
   }
 })
+
+
+test('an additive field survives a round trip through an older structural object type', () => {
+  const a = harness(() => {}, true).runtime, b = harness(() => {}, true).runtime
+  const source = cell('record', 'ref', { title: 'shared', badge: { color: 'blue' } })
+  const destination = cell('record', 'ref', { title: 'local' })
+  destination.cell.schema = { root: 0, nodes: [
+    { kind: 'object', fields: [{ name: 'title', optional: false, shape: 1 }], index: null },
+    { kind: 'primitive', name: 'string' },
+  ] }
+  a.register(source.cell); b.register(destination.cell)
+  expect(b.restore(structuredClone(a.capture())).rejected).toEqual([])
+  expect(destination.cell.read()).toEqual({ title: 'shared', badge: { color: 'blue' } })
+  destination.reset({ title: 'edited in older build', badge: { color: 'blue' } })
+  expect(a.restore(structuredClone(b.capture())).rejected).toEqual([])
+  expect(source.cell.read()).toEqual({ title: 'edited in older build', badge: { color: 'blue' } })
+})
