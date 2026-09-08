@@ -100,16 +100,24 @@ function call(index, operation, snapshot, commands) {
   const started = performance.now();
   return new Promise((resolve, reject) => {
     const id = ++sequence;
+    const transfer = snapshot instanceof Promise ? new MessageChannel() : null;
     const finish = (error, result, timing) => {
+      transfer?.port1.close();
       const roundTripMs = performance.now() - started;
       if (commands !== undefined) commands.push({ build: index, operation, roundTripMs, ...timing,
-        transportAndQueueMs: timing === undefined ? undefined : Math.max(0, roundTripMs - timing.sessionMs - timing.operationMs),
+        transportAndQueueMs: timing === undefined ? undefined : Math.max(0, roundTripMs - Math.max(timing.sessionMs, timing.payloadWaitMs ?? 0) - timing.operationMs),
         error: error?.message });
       if (error !== null) reject(error); else resolve(result);
     };
-    const timer = setTimeout(() => { pending.delete(id); finish(Error(operation === 'ready' ? 'Application did not mount; check its login and backend connection' : 'Build did not respond to ' + operation)); }, operation === 'ready' ? 30000 : 5000);
+    const timer = setTimeout(() => { pending.delete(id); finish(Error(operation === 'ready' ? 'Application did not mount; check its login and backend connection' : 'Build did not respond to ' + operation)); }, operation === 'ready' ? 30000 : transfer === null ? 5000 : 10000);
     pending.set(id, { index, finish, timer });
-    try { frames[index].contentWindow.postMessage({ channel: 'preview-state', id, operation, snapshot }, origins[index]); }
+    try {
+      frames[index].contentWindow.postMessage({ channel: 'preview-state', id, operation, snapshot: transfer === null ? snapshot : undefined }, origins[index], transfer === null ? [] : [transfer.port2]);
+      if (transfer !== null) void snapshot.then(
+        value => { if (pending.has(id)) transfer.port1.postMessage({ snapshot: value }); },
+        error => { if (pending.has(id)) transfer.port1.postMessage({ error: error instanceof Error ? error.message : String(error) }); }
+      ).catch(error => { if (pending.delete(id)) { clearTimeout(timer); finish(error); } });
+    }
     catch (error) { pending.delete(id); clearTimeout(timer); finish(error); }
   });
 }
@@ -129,8 +137,12 @@ async function swap(index) {
     // total; its command timings explain the work that was already in flight.
     record.timing.routePreparation = preparation.commands;
     if (preparation.error !== null) throw preparation.error;
-    snapshot = await call(active, 'capture', undefined, record.timing.commands);
-    let result = await call(index, 'restore', snapshot, record.timing.commands);
+    // Both frames authenticate concurrently. The destination receives its data
+    // through this request's private port as soon as capture completes.
+    const captured = call(active, 'capture', undefined, record.timing.commands);
+    const restored = call(index, 'restore', captured, record.timing.commands);
+    let result;
+    [snapshot, result] = await Promise.all([captured, restored]);
     if (result.needsFull) {
       snapshot = await call(active, 'checkpoint', undefined, record.timing.commands);
       result = await call(index, 'restore', snapshot, record.timing.commands);

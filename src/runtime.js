@@ -307,17 +307,38 @@ function restore(packet) {
 
 globalThis.__preview = { capture, restore }
 
+// A restore request can arrive before its payload so session verification and
+// source capture overlap. The port belongs only to this authenticated parent
+// request and is closed on every completion, failure, or payload timeout.
+function receiveTransfer(port) {
+  let timer
+  const promise = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('Source capture did not complete')), 5000)
+    port.onmessage = event => {
+      const payload = event.data
+      if (payload === null || typeof payload !== 'object') { reject(new Error('Invalid transfer payload')); return }
+      if (typeof payload.error === 'string') reject(new Error(payload.error))
+      else resolve(payload.snapshot)
+    }
+    port.onmessageerror = () => reject(new Error('Invalid transfer payload'))
+  })
+  return { promise, close() { clearTimeout(timer); port.close() } }
+}
+
 addEventListener('message', async event => {
   if (event.source !== parent || parent === window || event.origin !== reviewerOrigin) return
   const message = event.data
   if (message === null || typeof message !== 'object' || message.channel !== 'preview-state' || !Number.isSafeInteger(message.id)) return
   let result
   const receivedAt = performance.now()
-  let authorizedAt = null
-  const timing = () => ({ sessionMs: (authorizedAt ?? performance.now()) - receivedAt, operationMs: authorizedAt === null ? 0 : performance.now() - authorizedAt })
+  let authorizedAt = null, payloadAt = receivedAt, operationAt = null
+  const transfer = message.operation === 'restore' && event.ports?.length === 1 ? receiveTransfer(event.ports[0]) : null
+  const timing = () => ({ sessionMs: (authorizedAt ?? performance.now()) - receivedAt, payloadWaitMs: payloadAt - receivedAt, operationMs: operationAt === null ? 0 : performance.now() - operationAt })
   try {
-  await checkSession()
-  authorizedAt = performance.now()
+  const authorization = checkSession().finally(() => { authorizedAt = performance.now() })
+  const incoming = transfer === null ? message.snapshot : transfer.promise.then(value => { payloadAt = performance.now(); return value })
+  const [, payload] = await Promise.all([authorization, incoming])
+  operationAt = performance.now()
   switch (message.operation) {
     case 'ready': await firstMount; result = { ready: cells.size > 0, incremental: incremental?.stats() }; break
     case 'capture': result = capture(); break
@@ -354,7 +375,7 @@ addEventListener('message', async event => {
       break
     }
     case 'restore': {
-      const snapshot = message.snapshot
+      const snapshot = payload
       requireSession(snapshot?.session)
       if (!Array.isArray(snapshot?.values) || snapshot.values.length > 2000 || !Array.isArray(snapshot.scroll) || !Array.isArray(snapshot.history?.entries)) return
       if (!Number.isSafeInteger(snapshot.history.index) || snapshot.history.index < 0 || snapshot.history.index >= snapshot.history.entries.length) return
@@ -369,5 +390,5 @@ addEventListener('message', async event => {
   parent.postMessage({ channel: 'preview-state', id: message.id, result, timing: timing() }, event.origin)
   } catch (error) {
     parent.postMessage({ channel: 'preview-state', id: message.id, error: error instanceof Error ? error.message : String(error), timing: timing() }, event.origin)
-  }
+  } finally { transfer?.close() }
 })
