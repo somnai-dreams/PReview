@@ -75,6 +75,21 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
       if (value === null || typeof value !== 'object' || !plain(value)) return false
       // Accessor-backed objects are executable state, not plain checkpoint data.
       if (Object.getOwnPropertySymbols(value).length > 0) return false
+      // A closed shape only needs its declared descriptors and a final count.
+      // Avoid constructing and deleting a second object for every data record.
+      if (shape.index === null) {
+        let present = 0
+        for (const field of shape.fields) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, field.name)
+          if (descriptor === undefined) {
+            if (!field.optional && !accepts(schema, undefined, field.shape, depth + 1)) return false
+          } else {
+            if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, field.shape, depth + 1)) return false
+            present++
+          }
+        }
+        return Object.getOwnPropertyNames(value).length === present
+      }
       const descriptors = Object.getOwnPropertyDescriptors(value)
       for (const field of shape.fields) {
         const descriptor = Object.hasOwn(descriptors, field.name) ? descriptors[field.name] : undefined
@@ -86,7 +101,7 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
         delete descriptors[field.name]
       }
       for (const descriptor of Object.values(descriptors)) {
-        if (shape.index === null || !('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, shape.index, depth + 1)) return false
+        if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, shape.index, depth + 1)) return false
       }
       return true
     }
