@@ -27,7 +27,7 @@ The mutation tests assert these known misses so they cannot be mistaken for pass
 
 The setter and fiber-override controls measure a synchronous React update in the synthetic app. The large-graph control measures three full read phases over 20,000 rows with 40,960,000 payload characters, then a revision read and a wrapped-write detection check. These are component measurements, not end-to-end timings for a replacement transfer engine, and the payload count is not network bytes.
 
-The experiment establishes whether React observation/overrides work and whether mutation coverage is sufficient to replace scans. A faster end-to-end engine is not established by a fast revision check that misses legal writes. The current proxy-based shortcut fails that coverage gate. A future compiler write-observation experiment could retain raw object identity, but would need explicit coverage for aliases, native collection operations and writes from uninstrumented dependencies before being trusted.
+The experiment establishes whether React observation/overrides work and whether mutation coverage is sufficient to replace scans. A faster end-to-end engine is not established by a fast revision check that misses legal writes. The current proxy-based shortcut fails that coverage gate. The follow-up [compiler write-observation experiment](../writes/README.md) retains raw object identity and audits write coverage and indexing cost without disabling comparisons.
 
 ## Local synthetic results, 2026-09-08
 

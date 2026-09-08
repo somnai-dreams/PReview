@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import { comparison } from '../../../src/values'
+import { WriteControls } from '../../writes/controls'
 import { mutations } from '../mutations'
 
 type Probe = { override: (id: string, value: unknown) => void; stats: () => { commits: number; mappedCells: number } }
@@ -55,6 +56,7 @@ function App() {
       output.textContent = JSON.stringify({ rows: rows.length, payloadCharacters: rows.length * 2048, threeReadPhasesMs: scannedMs, revisionReadMs, unchanged, wrappedWriteDetected: largeTracker.revision() > revision, note: 'Component probe only; revision check misses raw-alias mutations.' }, null, 2)
     }}>Measure large synthetic graph</button>
     <p>{result}</p>
+    <WriteControls />
   </main>
 }
 
