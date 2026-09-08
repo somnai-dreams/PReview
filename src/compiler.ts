@@ -1,15 +1,7 @@
 import ts from 'typescript'
 import { relative, resolve } from 'node:path'
-
-type Shape =
-  | { kind: 'reject'; reason: string }
-  | { kind: 'primitive'; name: string }
-  | { kind: 'literal'; value: string | number | boolean | null }
-  | { kind: 'union'; members: number[] }
-  | { kind: 'array' | 'set'; item: number }
-  | { kind: 'object'; fields: { name: string; optional: boolean; shape: number }[]; index: number | null }
-export type Schema = { root: number; nodes: Shape[] }
-export type Cell = { id: string; line: number; type: string; policy: 'candidate' | 'effect-owned' | 'canvas-owned'; schema: Schema }
+import type { Shape, Schema } from './values'
+export type Cell = { id: string; kind: 'state' | 'ref'; line: number; type: string; policy: 'candidate' | 'effect-owned' | 'canvas-owned' | 'opaque-ref'; schema: Schema }
 
 export function prepare(checkout: string) {
   const configPath = resolve(checkout, 'tsconfig.json')
@@ -21,7 +13,7 @@ export function prepare(checkout: string) {
   const cells: Cell[] = []
   const sources = new Map<string, string>()
 
-  function schemaFor(root: ts.Type): Schema {
+  function schemaFor(root: ts.Type, location: ts.Node): Schema {
     const nodes: Shape[] = []
     const seen = new Map<ts.Type, number>()
     function visit(type: ts.Type): number {
@@ -32,6 +24,7 @@ export function prepare(checkout: string) {
       nodes.push({ kind: 'reject', reason: 'unfinished' })
       function finish(shape: Shape) { nodes[id] = shape; return id }
       if (id > 1000) return finish({ kind: 'reject', reason: 'schema size' })
+      if (type.flags & ts.TypeFlags.Unknown) return finish({ kind: 'data' })
       if (type.flags & ts.TypeFlags.StringLiteral) return finish({ kind: 'literal', value: (type as ts.StringLiteralType).value })
       if (type.flags & ts.TypeFlags.NumberLiteral) return finish({ kind: 'literal', value: (type as ts.NumberLiteralType).value })
       if (type.flags & ts.TypeFlags.BooleanLiteral) return finish({ kind: 'literal', value: checker.typeToString(type) === 'true' })
@@ -40,26 +33,44 @@ export function prepare(checkout: string) {
         if (type.flags & flag) return finish({ kind: 'primitive', name })
       }
       if (type.isUnion()) return finish({ kind: 'union', members: type.types.map(visit) })
+      if (checker.isTupleType(type)) {
+        const tuple = type as ts.TupleTypeReference
+        const flags = tuple.target.elementFlags
+        if (flags.some(flag => flag & (ts.ElementFlags.Rest | ts.ElementFlags.Variadic))) return finish({ kind: 'reject', reason: 'variable tuple' })
+        return finish({ kind: 'tuple', items: checker.getTypeArguments(tuple).map(visit), required: flags.filter(flag => flag & ts.ElementFlags.Required).length })
+      }
       if (checker.isArrayType(type)) {
         const item = checker.getTypeArguments(type as ts.TypeReference)[0]
         return finish(item === undefined ? { kind: 'reject', reason: 'array element' } : { kind: 'array', item: visit(item) })
       }
       const symbol = type.getSymbol()
+      if (symbol?.name === 'Map' || symbol?.name === 'ReadonlyMap') {
+        const [key, value] = checker.getTypeArguments(type as ts.TypeReference)
+        function primitiveKey(type: ts.Type): boolean {
+          if (type.isUnion()) return type.types.every(primitiveKey)
+          return (type.flags & (ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.Null | ts.TypeFlags.Undefined)) !== 0
+        }
+        if (key !== undefined && !primitiveKey(key)) return finish({ kind: 'reject', reason: 'Map keys must be primitive values' })
+        return finish(key === undefined || value === undefined ? { kind: 'reject', reason: 'map arguments' } : { kind: 'map', key: visit(key), value: visit(value) })
+      }
       if (symbol?.name === 'Set' || symbol?.name === 'ReadonlySet') {
         const item = checker.getTypeArguments(type as ts.TypeReference)[0]
         return finish(item === undefined ? { kind: 'reject', reason: 'set element' } : { kind: 'set', item: visit(item) })
       }
-      if (!(type.flags & ts.TypeFlags.Object) || checker.isTupleType(type) || type.getCallSignatures().length > 0 || type.getConstructSignatures().length > 0 || symbol?.declarations?.some(ts.isClassDeclaration)) {
+      const objectShape = (type.flags & ts.TypeFlags.Object) !== 0 || type.isIntersection() && type.types.every(member => (member.flags & ts.TypeFlags.Object) !== 0)
+      if (!objectShape || type.getCallSignatures().length > 0 || type.getConstructSignatures().length > 0 || symbol?.declarations?.some(ts.isClassDeclaration)) {
         return finish({ kind: 'reject', reason: checker.typeToString(type) })
       }
       const properties = type.getProperties()
+      if (properties.some(property => property.declarations?.some(declaration => ts.isMethodSignature(declaration) || ts.isMethodDeclaration(declaration)))) {
+        return finish({ kind: 'reject', reason: 'object with methods' })
+      }
       const stringIndex = type.getStringIndexType()
       if (properties.length === 0 && stringIndex === undefined) return finish({ kind: 'reject', reason: 'opaque object' })
       const fields: { name: string; optional: boolean; shape: number }[] = []
       for (const property of properties) {
         const declaration = property.valueDeclaration ?? property.declarations?.[0]
-        if (declaration === undefined || ts.isMethodSignature(declaration) || ts.isMethodDeclaration(declaration)) return finish({ kind: 'reject', reason: 'method' })
-        fields.push({ name: property.name, optional: (property.flags & ts.SymbolFlags.Optional) !== 0, shape: visit(checker.getTypeOfSymbolAtLocation(property, declaration)) })
+        fields.push({ name: property.name, optional: (property.flags & ts.SymbolFlags.Optional) !== 0, shape: visit(checker.getTypeOfSymbolAtLocation(property, declaration ?? location)) })
       }
       return finish({ kind: 'object', fields, index: stringIndex === undefined ? null : visit(stringIndex) })
     }
@@ -98,19 +109,24 @@ export function prepare(checkout: string) {
     }
     findCanvasOwners(source)
     function walk(node: ts.Node) {
-      if (ts.isVariableDeclaration(node) && ts.isArrayBindingPattern(node.name) && node.initializer !== undefined && ts.isCallExpression(node.initializer)) {
+      if (ts.isVariableDeclaration(node) && node.initializer !== undefined && ts.isCallExpression(node.initializer)) {
         const call = node.initializer
-        const isState = ts.isIdentifier(call.expression) && call.expression.text === 'useState'
-          || ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === 'useState' && call.expression.expression.getText(source) === 'React'
-        const first = node.name.elements[0]
-        if (isState && first !== undefined && ts.isBindingElement(first) && ts.isIdentifier(first.name)) {
+        const hook = ts.isIdentifier(call.expression) ? call.expression.text
+          : ts.isPropertyAccessExpression(call.expression) && call.expression.expression.getText(source) === 'React' ? call.expression.name.text : ''
+        const first = ts.isArrayBindingPattern(node.name) ? node.name.elements[0] : undefined
+        const binding = hook === 'useRef' && ts.isIdentifier(node.name) ? node.name
+          : hook === 'useState' && first !== undefined && ts.isBindingElement(first) && ts.isIdentifier(first.name) ? first.name : null
+        if (binding !== null) {
+          const kind = hook === 'useRef' ? 'ref' : 'state'
           const owner = stateOwner(node)
           let ownerName = 'anonymous'
           if (ts.isFunctionDeclaration(owner) || ts.isFunctionExpression(owner)) ownerName = owner.name?.text ?? 'anonymous'
           else if (ts.isArrowFunction(owner) && ts.isVariableDeclaration(owner.parent) && ts.isIdentifier(owner.parent.name)) ownerName = owner.parent.name.text
-          const id = path + ':' + ownerName + ':' + first.name.text
-          const type = checker.getTypeAtLocation(first.name)
-          const second = node.name.elements[1]
+          const id = path + ':' + ownerName + ':' + binding.text
+          const bindingType = checker.getTypeAtLocation(binding)
+          const current = bindingType.getProperty('current')
+          const type = kind === 'ref' && current !== undefined ? checker.getTypeOfSymbolAtLocation(current, binding) : bindingType
+          const second = ts.isArrayBindingPattern(node.name) ? node.name.elements[1] : undefined
           let policy: Cell['policy'] = 'candidate'
           if (second !== undefined && ts.isBindingElement(second) && ts.isIdentifier(second.name)) {
             const setterName = second.name
@@ -136,13 +152,36 @@ export function prepare(checkout: string) {
             if (references > 0 && !outsideEffect) policy = 'effect-owned'
           }
           if (canvasOwners.has(owner)) policy = 'canvas-owned'
-          const schema: Schema = policy === 'candidate' ? schemaFor(type) : {root:0,nodes:[{kind:'reject',reason:policy + ' state'}]}
-          const cell = { id, line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1, type: checker.typeToString(type), policy, schema }
+          let schema: Schema = policy === 'candidate' ? schemaFor(type, binding) : {root:0,nodes:[{kind:'reject',reason:policy + ' state'}]}
+          // Keep pure handles local, including null DOM refs and empty callback
+          // arrays. Data containers may have unsupported optional/union branches:
+          // validate their complete current value instead of discarding the type.
+          function carriesData(id: number, seen = new Set<number>()): boolean {
+            if (seen.has(id)) return false
+            seen.add(id)
+            const shape = schema.nodes[id]!
+            switch (shape.kind) {
+              case 'reject': return false
+              case 'data': return true
+              case 'primitive': return shape.name !== 'undefined'
+              case 'literal': return shape.value !== null
+              case 'union': return shape.members.some(member => carriesData(member, seen))
+              case 'array': case 'set': return carriesData(shape.item, seen)
+              case 'tuple': return shape.items.some(item => carriesData(item, seen))
+              case 'map': return carriesData(shape.value, seen)
+              case 'object': return shape.fields.some(field => carriesData(field.shape, seen)) || shape.index !== null && carriesData(shape.index, seen)
+            }
+          }
+          if (kind === 'ref' && policy === 'candidate' && schema.nodes.some(shape => shape.kind === 'reject') && !carriesData(schema.root)) {
+            policy = 'opaque-ref'
+            schema = { root: 0, nodes: [{ kind: 'reject', reason: 'ref holds handles or unsupported values without data' }] }
+          }
+          const cell: Cell = { id, kind, line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1, type: checker.typeToString(type), policy, schema }
           cells.push(cell)
           const initial = call.arguments[0]?.getText(source) ?? 'undefined'
           const schemaIndex = schemas.length
           schemas.push(schema)
-          edits.push({ start: call.getStart(source), end: call.end, text: '__previewState(' + JSON.stringify(id) + ',__previewSchemas[' + schemaIndex + '],' + initial + ')' })
+          edits.push({ start: call.getStart(source), end: call.end, text: (kind === 'ref' ? '__previewRef(' : '__previewState(') + JSON.stringify(id) + ',__previewSchemas[' + schemaIndex + '],' + initial + ')' })
         }
       }
       ts.forEachChild(node, walk)
@@ -151,7 +190,7 @@ export function prepare(checkout: string) {
     if (edits.length === 0) continue
     let result = source.text
     for (const edit of edits.sort((a, b) => b.start - a.start)) result = result.slice(0, edit.start) + edit.text + result.slice(edit.end)
-    sources.set(source.fileName, "import { useObservedState as __previewState } from 'preview-runtime';\nconst __previewSchemas = " + JSON.stringify(schemas) + ';\n' + result)
+    sources.set(source.fileName, "import { useObservedState as __previewState, useObservedRef as __previewRef } from 'preview-runtime';\nconst __previewSchemas = " + JSON.stringify(schemas) + ';\n' + result)
   }
   return { cells, sources }
 }
