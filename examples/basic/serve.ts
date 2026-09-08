@@ -32,4 +32,4 @@ for (const [variant, port] of [['A', localPort(String(hostPort + 1))], ['B', loc
   })
 }
 
-startReviewer({ port: hostPort, builds: ['http://localhost:' + (hostPort + 1), 'http://localhost:' + (hostPort + 2)] })
+startReviewer({ port: hostPort, builds: [1, 2].map(offset => ({ url: 'http://localhost:' + (hostPort + offset), label: 'Build ' + (offset === 1 ? 'A' : 'B') })) })

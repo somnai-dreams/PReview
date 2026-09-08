@@ -1,3 +1,16 @@
+import { createServer } from 'node:net'
+
+export async function availablePort(port: number) {
+  // Node and Bun may resolve localhost to different address families.
+  for (const address of ['127.0.0.1', '::1']) {
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer()
+      server.once('error', () => reject(new Error('Port ' + port + ' is in use or unavailable; choose another --port')))
+      server.listen(port, address, () => { server.close(error => error === undefined ? resolve() : reject(error)) })
+    })
+  }
+}
+
 export function localPort(raw: string | undefined): number {
   const port = Number(raw)
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Expected a port between 1024 and 65535')

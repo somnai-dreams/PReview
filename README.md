@@ -19,6 +19,8 @@ Open **http://localhost:4510**. Edit the draft, change the tone, increment the c
 
 The ref controls also exercise a shared object inside a Map and a memoized consumer of that Map. "Append ref without rendering" changes only the ref; switch builds to see the destination pick up the change. Use `PORT=4610 bun demo` to run a second example on ports 4610–4612.
 
+"Edit saved result" exercises data whose type also permits an optional buffer. Ordinary results transfer as complete values. To check rejection, toggle a local resource in B, switch to A, then try B again: the destination resource stays local and A remains visible. Transfer details list cell identities and reasons without printing their values.
+
 The self-contained example serves two visual variants of one small React app on ports 4511 and 4512. It needs no account, credentials, external services, or project-specific assets. These variants exercise the integration; they are not a claim of compatibility with every router or application.
 
 ## Use with another application
@@ -67,7 +69,7 @@ The compiler reads the checkout's `tsconfig.json` and examines source files unde
 
 The runtime records mounted values and setters. It skips ambiguous repeated instances, clones accepted values, and restores them through normal React updates. A pending checkpoint also initializes newly mounted observed components. A second pass follows mounting, and the wrapper reports restored, absent, rejected, and changed values.
 
-Refs are read from their current value at capture time, including in-place mutations since the last render. The checkpoint is cloned as one graph to retain shared references. Restoration reuses compatible mutable destination containers and schedules their owners to render, so existing Map references and memoized consumers continue to see changes. Read-only or incompatible containers are replaced. A ref whose type includes unsupported values is kept local even when its current value is null or empty.
+Refs are read from their current value at capture time, including in-place mutations since the last render. The checkpoint is cloned as one graph to retain shared references. Restoration reuses compatible mutable destination containers and schedules their owners to render, so existing Map references and memoized consumers continue to see changes. Read-only or incompatible containers are replaced. Pure handle refs stay local, including null DOM refs and empty callback arrays. Data containers may include unsupported optional or union branches, but their complete current values must validate at both ends; no fields are stripped.
 
 No application source or runtime state is uploaded by PReview. State is exchanged directly between the localhost frames and their parent via `postMessage`. Debug snapshots remain accessible in the reviewer's page memory as `window.lastTransfer`.
 
@@ -80,7 +82,7 @@ No application source or runtime state is uploaded by PReview. State is exchange
 - State in repeated instances of the same component is skipped when its identity is ambiguous. Renames and moved declarations change identity. Aliased hook imports and other hook calling conventions are not recognized.
 - Routing currently assumes a unique observed state value corresponding to `history.state` and an app that handles `popstate`. It intercepts History API methods to keep a separate navigation journal for each iframe. This is not a general router adapter and does not preserve arbitrary browser navigation behavior.
 - Scroll restoration handles scroll containers with unique element IDs. It first tries a visible link anchor, then falls back to pixels. It does not make independently loaded feeds identical.
-- Restoration uses frame timing, not application-specific readiness. Async effects may overwrite restored state later. A failed restore can leave the hidden destination partially updated; there is no transaction rollback.
+- Route preparation and restoration explicitly flush React commits, so hidden builds do not depend on animation frames. This does not wait for application-specific asynchronous work; later effects or responses may overwrite restored state. A failed restore can leave the hidden destination partially updated; there is no transaction rollback.
 - Copyable data can still represent a request flag, timer ID or mutation receipt. The observer does not infer all of these meanings from a primitive type. Restore between settled builds; ref support does not move in-flight work or provide execution-state migration.
 - Builds remain mounted, so their effects, network connections and memory use remain active. This is not a suspension mechanism. Bundle generation runs once at startup; hot reload is not implemented.
 
@@ -101,5 +103,7 @@ bun check
 This runs the compiler regression test, strict TypeScript checks for the TypeScript sources, and linting. The browser runtime and inline host script are JavaScript; the TypeScript check does not cover them. Browser checks remain manual in this initial version.
 
 The value tests cover Map and tuple validation, container identity, shared references, subsequent mutation, and rejection of executable data. See [architecture notes](docs/architecture.md) for the compiler-versus-fiber tradeoff.
+
+The reviewer enables a build after its observer has mounted, reports failed route preparation and runtime errors, and keeps the source visible when destination validation rejects the checkpoint. This initial mount check does not mean all network activity has settled. The programmatic `startReviewer` API takes `builds: [{ url, label }, ...]`; the CLI uses origins as labels.
 
 The package uses TypeScript 5 for its compiler API and TypeScript 7 for checking. React is used by the example and must resolve from the target application's dependencies when integrating the plugin. This repository is used from source; it is not published to npm.

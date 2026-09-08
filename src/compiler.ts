@@ -62,6 +62,9 @@ export function prepare(checkout: string) {
         return finish({ kind: 'reject', reason: checker.typeToString(type) })
       }
       const properties = type.getProperties()
+      if (properties.some(property => property.declarations?.some(declaration => ts.isMethodSignature(declaration) || ts.isMethodDeclaration(declaration)))) {
+        return finish({ kind: 'reject', reason: 'object with methods' })
+      }
       const stringIndex = type.getStringIndexType()
       if (properties.length === 0 && stringIndex === undefined) return finish({ kind: 'reject', reason: 'opaque object' })
       const fields: { name: string; optional: boolean; shape: number }[] = []
@@ -150,11 +153,28 @@ export function prepare(checkout: string) {
           }
           if (canvasOwners.has(owner)) policy = 'canvas-owned'
           let schema: Schema = policy === 'candidate' ? schemaFor(type, binding) : {root:0,nodes:[{kind:'reject',reason:policy + ' state'}]}
-          // An empty callback array or null DOM ref must not look transferable
-          // merely because its current value happens to contain no resource yet.
-          if (kind === 'ref' && policy === 'candidate' && schema.nodes.some(shape => shape.kind === 'reject')) {
+          // Keep pure handles local, including null DOM refs and empty callback
+          // arrays. Data containers may have unsupported optional/union branches:
+          // validate their complete current value instead of discarding the type.
+          function carriesData(id: number, seen = new Set<number>()): boolean {
+            if (seen.has(id)) return false
+            seen.add(id)
+            const shape = schema.nodes[id]!
+            switch (shape.kind) {
+              case 'reject': return false
+              case 'data': return true
+              case 'primitive': return shape.name !== 'undefined'
+              case 'literal': return shape.value !== null
+              case 'union': return shape.members.some(member => carriesData(member, seen))
+              case 'array': case 'set': return carriesData(shape.item, seen)
+              case 'tuple': return shape.items.some(item => carriesData(item, seen))
+              case 'map': return carriesData(shape.value, seen)
+              case 'object': return shape.fields.some(field => carriesData(field.shape, seen)) || shape.index !== null && carriesData(shape.index, seen)
+            }
+          }
+          if (kind === 'ref' && policy === 'candidate' && schema.nodes.some(shape => shape.kind === 'reject') && !carriesData(schema.root)) {
             policy = 'opaque-ref'
-            schema = { root: 0, nodes: [{ kind: 'reject', reason: 'ref type contains resources or unsupported values' }] }
+            schema = { root: 0, nodes: [{ kind: 'reject', reason: 'ref holds handles or unsupported values without data' }] }
           }
           const cell: Cell = { id, kind, line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1, type: checker.typeToString(type), policy, schema }
           cells.push(cell)

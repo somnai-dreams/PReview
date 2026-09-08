@@ -1,9 +1,12 @@
 import { useState, useLayoutEffect, useRef } from 'react'
+import { flushSync } from 'react-dom'
 import { accepts, equal, reconcile, restoration } from './values'
 
 // Replaced by the external bundler for this comparison host.
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
 const cells = new Map()
+let markMounted
+const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
 let interacted = false
 for (const type of ['pointerdown','keydown','input']) addEventListener(type,event=>{if(event.isTrusted)interacted=true},{capture:true})
@@ -52,6 +55,7 @@ function observe(cell) {
     let instances = cells.get(cell.id)
     if (instances === undefined) { instances = []; cells.set(cell.id, instances) }
     instances.push(cell)
+    markMounted()
     return () => {
       const index = instances.indexOf(cell)
       if (index !== -1) instances.splice(index, 1)
@@ -82,7 +86,7 @@ export function useObservedRef(id, schema, initial) {
   const mounted = useRef(false)
   if (!mounted.current && pending !== null) {
     const saved = pending.values.find(cell => cell.id === id && cell.kind === 'ref')
-    if (saved !== undefined && accepts(schema, saved.value)) ref.current = reconcile(saved.value, ref.current, pending.context)
+    if (saved !== undefined && accepts(schema, saved.value) && accepts(schema, ref.current)) ref.current = reconcile(saved.value, ref.current, pending.context)
   }
   useLayoutEffect(() => { mounted.current = true }, [])
   const token = useRef({ id, schema, kind: 'ref',
@@ -94,6 +98,7 @@ export function useObservedRef(id, schema, initial) {
 }
 
 function capture() {
+  const started = performance.now()
   const values = [], skipped = []
   for (const [id, instances] of cells) {
     if (instances.length !== 1) { skipped.push({ id, reason: 'multiple instances', count: instances.length }); continue }
@@ -124,12 +129,13 @@ function capture() {
     scroll.push({ id: element.id, top: element.scrollTop, left: element.scrollLeft, anchor })
   }
   // Clone the complete graph once, retaining shared references across cells.
-  return structuredClone({ values, skipped, scroll, history: navigation })
+  const snapshot = structuredClone({ values, skipped, scroll, history: navigation })
+  snapshot.captureMs = performance.now() - started
+  return snapshot
 }
 
-const paint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-
-async function restore(snapshot) {
+function restore(snapshot) {
+  const started = performance.now()
   const restored = [], rejected = [], absent = []
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
@@ -139,6 +145,7 @@ async function restore(snapshot) {
     restored.push(saved.id)
   }
   if (rejected.length > 0) return { restored: [], rejected, absent, current: capture() }
+  const validated = performance.now()
   pending = { values: snapshot.values, context: restoration() }
   function applyValues() {
     // Ref containers establish destination identities before state that may
@@ -161,19 +168,19 @@ async function restore(snapshot) {
     }
   }
   try {
-  applyValues()
+  flushSync(applyValues)
+  const firstCommit = performance.now()
   navigation = structuredClone(snapshot.history)
   const target = navigation.entries[navigation.index]
   nativeReplace(target.state, '', target.path)
-  await paint()
   // Native route changes mount components and run their normal reset effects.
   // Restore the checkpoint after that mount, including state newly discovered there.
   const secondPass = snapshot.values.filter(saved => {
     const instances = cells.get(saved.id)
     return instances?.length === 1 && !equal(instances[0].read(), saved.value)
   }).map(saved => saved.id)
-  applyValues()
-  await paint()
+  flushSync(applyValues)
+  const secondCommit = performance.now()
   const scrollRestored = []
   for (const saved of snapshot.scroll) {
     const element = document.getElementById(saved.id)
@@ -192,13 +199,13 @@ async function restore(snapshot) {
     element.scrollTo(saved.left, top)
     scrollRestored.push({id:saved.id,method})
   }
-  await paint()
   const current = capture()
   const changed = snapshot.values.filter(saved => {
     const actual = current.values.find(cell => cell.id === saved.id)
     return actual !== undefined && !equal(saved.value, actual.value)
   }).map(cell => cell.id)
-  return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, current }
+  return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, current,
+    timing: { validationMs: validated - started, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, verificationMs: performance.now() - secondCommit } }
   } finally { pending = null }
 }
 
@@ -209,7 +216,9 @@ addEventListener('message', async event => {
   const message = event.data
   if (message === null || typeof message !== 'object' || message.channel !== 'preview-state' || !Number.isSafeInteger(message.id)) return
   let result
+  try {
   switch (message.operation) {
+    case 'ready': await firstMount; result = { ready: cells.size > 0 }; break
     case 'capture': result = capture(); break
     case 'prepare': {
       const journal = message.snapshot
@@ -225,8 +234,9 @@ addEventListener('message', async event => {
       if(owners.length!==1||!accepts(owners[0].schema,target.state)){result={navigated:false};break}
       navigation=structuredClone(journal)
       nativeReplace(target.state,'',target.path)
-      dispatchEvent(new PopStateEvent('popstate',{state:structuredClone(target.state)}))
-      await paint()
+      // Hidden builds may never receive animation frames. Commit the route
+      // before acknowledging preparation so newly mounted owners are present.
+      flushSync(() => dispatchEvent(new PopStateEvent('popstate',{state:structuredClone(target.state)})))
       result={navigated:true}
       break
     }
@@ -243,4 +253,7 @@ addEventListener('message', async event => {
     default: return
   }
   parent.postMessage({ channel: 'preview-state', id: message.id, result }, event.origin)
+  } catch (error) {
+    parent.postMessage({ channel: 'preview-state', id: message.id, error: error instanceof Error ? error.message : String(error) }, event.origin)
+  }
 })

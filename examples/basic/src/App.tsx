@@ -11,6 +11,7 @@ function App() {
   const rows = useRef(new Map<string, { title: string; tags: string[] }>([['one', { title: 'First item', tags: [] }]]))
   const selected = useRef(rows.current.get('one')!)
   const rememberedRows = useMemo(() => rows.current, [])
+  const result = useRef<{ title: string; pixels?: Uint8Array }>({ title: 'Saved result' })
   const [, render] = useState(0)
   return <main style={{ maxWidth: 720, margin: '64px auto', padding: 24, fontFamily: 'system-ui', color: '#172129' }}>
     <p>BUILD {BUILD_VARIANT}</p>
@@ -26,6 +27,9 @@ function App() {
       <p>Memoized Map size: {rememberedRows.size}</p>
       <button onClick={() => { selected.current.title = 'Edited in ' + BUILD_VARIANT; selected.current.tags.push(BUILD_VARIANT); render(value => value + 1) }}>Edit ref item</button>
       <button onClick={() => { rows.current.set(String(rows.current.size), { title: 'Added without rendering', tags: [] }) }}>Append ref without rendering</button>
+      <p>Result: {result.current.title}; resource: {result.current.pixels === undefined ? 'none' : 'local buffer'}</p>
+      <button onClick={() => { result.current.title = 'Result from ' + BUILD_VARIANT; render(value => value + 1) }}>Edit saved result</button>
+      <button onClick={() => { result.current = result.current.pixels === undefined ? { ...result.current, pixels: new Uint8Array(1) } : { title: result.current.title }; render(value => value + 1) }}>Toggle local resource</button>
     </section>
   </main>
 }

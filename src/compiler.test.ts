@@ -22,6 +22,8 @@ type Row = {title:string} & {position:[number,number]}
 export function DataOwner(){const cache=useRef<Map<string,Row>>(new Map());return cache}
 export function MetadataOwner(){const metadata=useRef<{counts:Partial<Record<'up'|'down',number>>;extra:Record<string,unknown>}>({counts:{},extra:{}});return metadata}
 export function Handles(){const element=useRef<HTMLDivElement|null>(null);const callbacks=useRef<Array<()=>void>>([]);return {element,callbacks}}
+type Result = {kind:'saved';title:string;pixels?:Uint8Array} | {kind:'active';resource:AbortController}
+export function MixedData(){const results=useRef<Result[]>([]);return results}
 `)
     const {cells,sources}=prepare(root)
     expect(cells.find(cell=>cell.id.endsWith('DraftOwner:draft'))?.policy).toBe('candidate')
@@ -39,6 +41,12 @@ export function Handles(){const element=useRef<HTMLDivElement|null>(null);const 
     expect(accepts(data.schema, new Map([['one', { title: 5, position: [1, 2] }]]))).toBe(false)
     expect(cells.filter(cell => cell.id.includes(':Handles:')).map(cell => cell.policy)).toEqual(['opaque-ref', 'opaque-ref'])
     expect(output).toContain('__previewRef(')
+    const mixed = cells.find(cell => cell.id.endsWith('MixedData:results'))!
+    expect(mixed.policy).toBe('candidate')
+    expect(accepts(mixed.schema, [{ kind: 'saved', title: 'ordinary data' }])).toBe(true)
+    expect(accepts(mixed.schema, [{ kind: 'saved', title: 'has resource', pixels: new Uint8Array(1) }])).toBe(false)
+    expect(accepts(mixed.schema, [{ kind: 'active', resource: new AbortController() }])).toBe(false)
+    expect(accepts(mixed.schema, [{ kind: 'saved', title: 1 }])).toBe(false)
     const metadata = cells.find(cell => cell.id.endsWith('MetadataOwner:metadata'))!
     expect(metadata.policy).toBe('candidate')
     expect(accepts(metadata.schema, { counts: { up: 2 }, extra: { nested: ['plain', 3] } })).toBe(true)
