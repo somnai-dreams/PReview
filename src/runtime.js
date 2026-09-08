@@ -179,6 +179,7 @@ function capture() {
 }
 
 function restore(packet) {
+  const started = performance.now()
   if (typeof packet.id !== 'string' || !(packet.base === null || typeof packet.base === 'string')) throw new Error('Invalid checkpoint identity')
   if (packet.base === null && (packet.values.some(saved => saved.reuse === true) || packet.references?.length)) throw new Error('A full checkpoint cannot contain references')
   if (packet.base !== null && checkpoint?.id !== packet.base) return { needsFull: true }
@@ -195,28 +196,34 @@ function restore(packet) {
     return previous
   })
   const snapshot = { values, scroll: packet.scroll, history: packet.history }
-  const started = performance.now()
+  const decodedAt = performance.now()
   const candidates = []
   for (const [id, instances] of cells) {
     if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
   }
   const { retained, matches, reverse } = reused.size === 0 ? { retained: new Set(), matches: new Map(), reverse: new Map() } : retainedCells(
     values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? checkpoint.owners.get(saved.id) : saved })), candidates, incremental?.phase())
-  const restored = [], rejected = [], absent = [], plan = []
+  const restored = [], rejections = [], skipped = [], absent = [], plan = []
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances === undefined) { absent.push(saved.id); continue }
+    if (instances.length !== 1) { skipped.push({ id: saved.id, reason: 'multiple instances', count: instances.length }); continue }
     if (retained.has(saved.id)) { restored.push(saved.id); continue }
     const current = instances[0].read(), matched = reverse.get(current)
     const validatedBefore = reused.has(saved.id) && checkpoint.owners.get(saved.id) === instances[0]
-    if (instances.length !== 1 || instances[0].kind !== saved.kind || !validatedBefore && !validation.accepts(instances[0].schema, saved.value)
-      || saved.kind === 'ref' && !(matched === undefined ? accepts(instances[0].schema, current) : validation.accepts(instances[0].schema, matched))) { rejected.push(saved.id); continue }
+    const reason = instances[0].kind !== saved.kind ? 'hook-kind-mismatch'
+      : !validatedBefore && !validation.accepts(instances[0].schema, saved.value) ? 'incoming-value-invalid'
+      : saved.kind === 'ref' && !(matched === undefined ? accepts(instances[0].schema, current) : validation.accepts(instances[0].schema, matched)) ? 'live-ref-invalid' : null
+    if (reason !== null) { rejections.push({ id: saved.id, reason, phase: 'validation' }); continue }
     plan.push({ saved, cell: instances[0] })
     restored.push(saved.id)
   }
-  if (rejected.length > 0) return { restored: [], rejected, absent }
   const validated = performance.now()
-  pending = { values: snapshot.values, context: restoration(matches, reverse) }
+  if (rejections.length > 0) return { restored: [], rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent, incremental: incremental?.stats(),
+    timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: 0, secondCommitMs: 0, verificationMs: 0, restoreMs: performance.now() - started } }
+  // Ambiguous owners stay local for this entire transfer, including remounts.
+  const transferable = snapshot.values.filter(saved => !skipped.some(item => item.id === saved.id))
+  pending = { values: transferable, context: restoration(matches, reverse) }
   function applyValues(entries) {
     // Validation precedes this synchronous commit. Refs establish canonical
     // container identities before state that may point into the same graph.
@@ -236,22 +243,25 @@ function restore(packet) {
   // Mount/reset effects can introduce owners or change restored values. Repair
   // only those cells, preserving the graph identities established above.
   const repairs = [], repairComparison = comparison(pending.context.copies, incremental?.phase())
-  for (const saved of snapshot.values) {
+  for (const saved of transferable) {
     const instances = cells.get(saved.id)
     if (instances === undefined) continue
-    if (instances.length !== 1 || instances[0].kind !== saved.kind) { rejected.push(saved.id); continue }
+    // A commit may already have initialized new owners: do not claim these
+    // stayed local, or silently accept an ownership change after applying state.
+    if (instances.length !== 1) { rejections.push({ id: saved.id, reason: 'multiple-instances-after-commit', count: instances.length, phase: 'repair' }); continue }
+    if (instances[0].kind !== saved.kind) { rejections.push({ id: saved.id, reason: 'hook-kind-mismatch', phase: 'repair' }); continue }
     const cell = instances[0]
     const known = retained.has(saved.id) && checkpoint.owners.get(saved.id) === cell || plan.some(entry => entry.saved === saved && entry.cell === cell)
-    if (!known && !validation.accepts(cell.schema, saved.value)) { rejected.push(saved.id); continue }
+    if (!known && !validation.accepts(cell.schema, saved.value)) { rejections.push({ id: saved.id, reason: 'incoming-value-invalid', phase: 'repair' }); continue }
     if (repairComparison.matches(saved.value, cell.read())) {
       if (!restored.includes(saved.id)) restored.push(saved.id)
       continue
     }
-    if (saved.kind === 'ref' && !accepts(cell.schema, cell.read())) { rejected.push(saved.id); continue }
+    if (saved.kind === 'ref' && !accepts(cell.schema, cell.read())) { rejections.push({ id: saved.id, reason: 'live-ref-invalid', phase: 'repair' }); continue }
     repairs.push({ saved, cell })
   }
   const secondPass = repairs.map(entry => entry.saved.id)
-  const repaired = rejected.length === 0 && repairs.length > 0
+  const repaired = rejections.length === 0 && repairs.length > 0
   if (repaired) {
     pending.context.pass++
     flushSync(() => applyValues(repairs))
@@ -261,9 +271,14 @@ function restore(packet) {
   // A commit can change any live cell. Without one, this is still the same
   // synchronous read phase: reuse its comparisons before touching scroll.
   const changed = [], verification = repaired ? comparison(pending.context.copies, incremental?.phase()) : repairComparison
-  for (const saved of snapshot.values) {
+  for (const saved of transferable) {
     const instances = cells.get(saved.id)
-    if (instances?.length === 1 && !verification.matches(saved.value, instances[0].read())) changed.push(saved.id)
+    if (instances === undefined) continue
+    if (instances.length !== 1) {
+      if (!rejections.some(item => item.id === saved.id)) rejections.push({ id: saved.id, reason: 'multiple-instances-after-commit', count: instances.length, phase: 'verification' })
+      continue
+    }
+    if (!verification.matches(saved.value, instances[0].read())) changed.push(saved.id)
   }
   const scrollRestored = []
   for (const saved of snapshot.scroll) {
@@ -283,10 +298,10 @@ function restore(packet) {
     element.scrollTo(saved.left, top)
     scrollRestored.push({id:saved.id,method})
   }
-  if (rejected.length === 0) checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
-  if (rejected.length === 0) incremental?.keep(snapshot.values.flatMap(saved => { const instances = cells.get(saved.id); return instances?.length === 1 && restored.includes(saved.id) && !changed.includes(saved.id) ? [{source:saved.value,target:instances[0].read()}] : [] }))
-  return { incremental: incremental?.stats(), restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
-    timing: { validationMs: validated - started, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, verificationMs: performance.now() - secondCommit } }
+  if (rejections.length === 0) checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
+  if (rejections.length === 0) incremental?.keep(snapshot.values.flatMap(saved => { const instances = cells.get(saved.id); return instances?.length === 1 && restored.includes(saved.id) && !changed.includes(saved.id) ? [{source:saved.value,target:instances[0].read()}] : [] }))
+  return { incremental: incremental?.stats(), restored, rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
+    timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, verificationMs: performance.now() - secondCommit, restoreMs: performance.now() - started } }
   } finally { pending = null }
 }
 
@@ -297,8 +312,12 @@ addEventListener('message', async event => {
   const message = event.data
   if (message === null || typeof message !== 'object' || message.channel !== 'preview-state' || !Number.isSafeInteger(message.id)) return
   let result
+  const receivedAt = performance.now()
+  let authorizedAt = null
+  const timing = () => ({ sessionMs: (authorizedAt ?? performance.now()) - receivedAt, operationMs: authorizedAt === null ? 0 : performance.now() - authorizedAt })
   try {
   await checkSession()
+  authorizedAt = performance.now()
   switch (message.operation) {
     case 'ready': await firstMount; result = { ready: cells.size > 0, incremental: incremental?.stats() }; break
     case 'capture': result = capture(); break
@@ -347,8 +366,8 @@ addEventListener('message', async event => {
     }
     default: return
   }
-  parent.postMessage({ channel: 'preview-state', id: message.id, result }, event.origin)
+  parent.postMessage({ channel: 'preview-state', id: message.id, result, timing: timing() }, event.origin)
   } catch (error) {
-    parent.postMessage({ channel: 'preview-state', id: message.id, error: error instanceof Error ? error.message : String(error) }, event.origin)
+    parent.postMessage({ channel: 'preview-state', id: message.id, error: error instanceof Error ? error.message : String(error), timing: timing() }, event.origin)
   }
 })

@@ -75,15 +75,16 @@ for (let index = 0; index < origins.length; index++) {
   document.body.append(frame);
   frames.push(frame);
 }
-const preparations = frames.map(() => Promise.resolve());
-const preparationErrors = frames.map(() => null);
+const preparations = frames.map(() => ({ promise: Promise.resolve(), error: null, commands: [] }));
 addEventListener('message', event => {
   if (event.data?.channel !== 'preview-navigation') return;
   const index = frames.findIndex(frame => frame.contentWindow === event.source);
   if (index !== active || event.origin !== origins[index]) return;
   for (let target = 0; target < frames.length; target++) {
     if (target === index) continue;
-    preparations[target] = call(target, 'prepare', event.data.history).then(result => { preparationErrors[target] = result.navigated ? null : Error('Destination could not follow this route'); }, error => { preparationErrors[target] = error; });
+    const preparation = { promise: null, error: null, commands: [] };
+    preparation.promise = call(target, 'prepare', event.data.history, preparation.commands).then(result => { preparation.error = result.navigated ? null : Error('Destination could not follow this route'); }, error => { preparation.error = error; });
+    preparations[target] = preparation;
   }
 });
 addEventListener('message', event => {
@@ -93,59 +94,89 @@ addEventListener('message', event => {
   if (!request || event.source !== frames[request.index].contentWindow || event.origin !== origins[request.index]) return;
   pending.delete(message.id);
   clearTimeout(request.timer);
-  if (typeof message.error === 'string') request.reject(Error(message.error));
-  else request.resolve(message.result);
+  request.finish(typeof message.error === 'string' ? Error(message.error) : null, message.result, message.timing);
 });
-function call(index, operation, snapshot) {
+function call(index, operation, snapshot, commands) {
+  const started = performance.now();
   return new Promise((resolve, reject) => {
     const id = ++sequence;
-    const timer = setTimeout(() => { pending.delete(id); reject(Error(operation === 'ready' ? 'Application did not mount; check its login and backend connection' : 'Build did not respond to ' + operation)); }, operation === 'ready' ? 30000 : 5000);
-    pending.set(id, { index, resolve, reject, timer });
-    frames[index].contentWindow.postMessage({ channel: 'preview-state', id, operation, snapshot }, origins[index]);
+    const finish = (error, result, timing) => {
+      const roundTripMs = performance.now() - started;
+      if (commands !== undefined) commands.push({ build: index, operation, roundTripMs, ...timing,
+        transportAndQueueMs: timing === undefined ? undefined : Math.max(0, roundTripMs - timing.sessionMs - timing.operationMs),
+        error: error?.message });
+      if (error !== null) reject(error); else resolve(result);
+    };
+    const timer = setTimeout(() => { pending.delete(id); finish(Error(operation === 'ready' ? 'Application did not mount; check its login and backend connection' : 'Build did not respond to ' + operation)); }, operation === 'ready' ? 30000 : 5000);
+    pending.set(id, { index, finish, timer });
+    try { frames[index].contentWindow.postMessage({ channel: 'preview-state', id, operation, snapshot }, origins[index]); }
+    catch (error) { pending.delete(id); clearTimeout(timer); finish(error); }
   });
 }
 async function swap(index) {
   if (index === active || busy) return;
   busy = true; engine.disabled = true;
   const started = performance.now();
+  const record = { source: active, destination: index, engine: engine.value, outcome: 'error', result: null, error: null, milliseconds: 0,
+    timing: { routeWaitMs: 0, commands: [], presentationMs: 0 } };
+  let snapshot = null;
   status.textContent = 'Transferring…';
   try {
-    await preparations[index];
-    if (preparationErrors[index] !== null) throw preparationErrors[index];
-    let snapshot = await call(active, 'capture');
-    let result = await call(index, 'restore', snapshot);
+    const preparation = preparations[index];
+    await preparation.promise;
+    record.timing.routeWaitMs = performance.now() - started;
+    // Preparation can precede the click. Only routeWaitMs belongs in the switch
+    // total; its command timings explain the work that was already in flight.
+    record.timing.routePreparation = preparation.commands;
+    if (preparation.error !== null) throw preparation.error;
+    snapshot = await call(active, 'capture', undefined, record.timing.commands);
+    let result = await call(index, 'restore', snapshot, record.timing.commands);
     if (result.needsFull) {
-      snapshot = await call(active, 'checkpoint');
-      result = await call(index, 'restore', snapshot);
+      snapshot = await call(active, 'checkpoint', undefined, record.timing.commands);
+      result = await call(index, 'restore', snapshot, record.timing.commands);
     }
-    const record = { source: active, destination: index, engine: snapshot.incremental?.enabled ? 'incremental' : 'full', result, milliseconds: 0 };
-    window.lastTransfer = record;
-    document.querySelector('#details').hidden = false;
-    const report = () => { document.querySelector('#report').textContent = JSON.stringify({ milliseconds: record.milliseconds, engine:record.engine, sourceIndex:snapshot.incremental, destinationIndex:result.incremental, restored: result.restored, absent: result.absent, rejected: result.rejected, secondPass: result.secondPass ?? [], changed: result.changed ?? [], retained: result.retained, transferred: result.transferred, keptLocal: snapshot.skipped, timing: { captureMs: snapshot.captureMs, comparisonMs: snapshot.comparisonMs, ...result.timing }, recent:benchmarkRecords }, null, 2); };
+    record.result = result;
+    record.engine = snapshot.incremental?.enabled ? 'incremental' : 'full';
     if (result.rejected.length) {
-      record.milliseconds = performance.now() - started; report();
-      status.textContent = 'Rejected ' + result.rejected.length + ' incompatible or ambiguous cells; kept source visible';
+      record.outcome = 'rejected';
+      status.textContent = 'Rejected ' + result.rejected.length + ' incompatible cells; kept source visible';
       return;
     }
+    const presenting = performance.now();
     frames[active].classList.remove('active');
     buttons[active].setAttribute('aria-pressed', 'false');
     active = index;
     frames[active].classList.add('active');
     buttons[active].setAttribute('aria-pressed', 'true');
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    record.timing.presentationMs = performance.now() - presenting;
+    record.outcome = 'restored';
+  } catch (error) {
+    record.error = error instanceof Error ? error.message : String(error);
+    status.textContent = record.error;
+  } finally {
     record.milliseconds = performance.now() - started;
-    benchmarkRecords.push({source:record.source,destination:index,engine:record.engine,milliseconds:record.milliseconds,rejected:result.rejected.length,changed:result.changed.length});
+    const result = record.result;
+    benchmarkRecords.push({ source: record.source, destination: index, engine: record.engine, outcome: record.outcome,
+      milliseconds: record.milliseconds, rejected: result?.rejected.length, changed: result?.changed?.length, error: record.error });
     if (benchmarkRecords.length > 100) benchmarkRecords.shift();
-    report();
-    status.textContent = result.restored.length + ' cells · ' + result.absent.length + ' absent · '
+    window.lastTransfer = record;
+    document.querySelector('#details').hidden = false;
+    document.querySelector('#report').textContent = JSON.stringify({ milliseconds: record.milliseconds, engine: record.engine, outcome: record.outcome, error: record.error,
+      sourceIndex: snapshot?.incremental, destinationIndex: result?.incremental,
+      indexStatistics: 'Current: indexedObjects, roots, pending, enabled, coverage. Other index counters and timings accumulate for the lifetime of each build.',
+      restored: result?.restored, absent: result?.absent, rejected: result?.rejected, rejectionDetails: result?.rejectionDetails,
+      secondPass: result?.secondPass, changed: result?.changed, retained: result?.retained, transferred: result?.transferred,
+      keptLocal: { source: snapshot?.skipped, destination: result?.skipped },
+      timing: { ...record.timing, capture: { captureMs: snapshot?.captureMs, comparisonMs: snapshot?.comparisonMs }, restore: result?.timing }, recent: benchmarkRecords }, null, 2);
+    if (record.outcome === 'restored') status.textContent = result.restored.length + ' cells · ' + result.absent.length + ' absent · '
+      + (result.skipped.length ? result.skipped.length + ' kept local · ' : '')
       + (result.changed.length ? result.changed.length + ' changed during restore · ' : '')
       + Math.round(record.milliseconds) + ' ms';
-  } catch (error) {
-    status.textContent = error instanceof Error ? error.message : String(error);
-  } finally {
     busy = false; engine.disabled = false;
   }
 }
+
 </script></body></html>`
 
 const script = html.slice(html.indexOf('<script type="module">') + '<script type="module">'.length, html.indexOf('</script>'))

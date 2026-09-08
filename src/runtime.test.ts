@@ -10,20 +10,23 @@ const runtimeSource = (await Bun.file(new URL('./runtime.js', import.meta.url)).
 type Cell = { id: string; kind: 'ref' | 'state'; schema: Schema; read: () => Value; write: (next: Value) => void }
 type Saved = { id: string; kind: Cell['kind']; value: Value }
 type Packet = { id: string; base: string | null; values: (Saved | { id: string; kind: Cell['kind']; reuse: true })[]; references?: { marker: object; cell: number; path: unknown[] }[]; scroll: never[]; history: typeof journal }
-type Report = { restored: string[]; rejected: string[]; absent: string[]; secondPass?: string[]; changed?: string[]; retained?: number; transferred?: number; needsFull?: boolean }
-type Runtime = { register: (cell: Cell) => void; restore: (snapshot: Packet) => Report; capture: () => Packet; full: () => Packet }
+type Report = { skipped: { id: string; reason: string; count: number }[]; rejectionDetails: { id: string; reason: string; phase: string; count?: number }[]; timing: { decodeMs: number; validationMs: number; restoreMs: number }; restored: string[]; rejected: string[]; absent: string[]; secondPass?: string[]; changed?: string[]; retained?: number; transferred?: number; needsFull?: boolean }
+type Runtime = { register: (cell: Cell) => void; duplicate: (cell: Cell) => void; remove: (id: string) => void; mountRef: (id: string, schema: Schema, initial: Value) => { current: Value }; mountState: (id: string, schema: Schema, initial: Value) => [Value, unknown]; restore: (snapshot: Packet) => Report; capture: () => Packet; full: () => Packet }
 const journal = { entries: [{ state: { route: '/' }, path: '/' }], index: 0 }
 const data: Schema = { root: 0, nodes: [{ kind: 'data' }] }
 
 function harness(afterCommit: (pass: number) => void = () => {}, allowCapture = false, incremental?: ReturnType<typeof incrementalCache>) {
   let commits = 0, clones = 0
-  const runtime = runInNewContext(runtimeSource + '\n;({restore,capture,full:()=>({...checkpoint.snapshot,id:checkpoint.id,base:null,references:[]}),register:cell=>cells.set(cell.id,[cell])})', {
+  const runtime = runInNewContext(runtimeSource + '\n;({restore,capture,full:()=>({...checkpoint.snapshot,id:checkpoint.id,base:null,references:[]}),register:cell=>cells.set(cell.id,[cell]),duplicate:cell=>cells.get(cell.id).push(cell),remove:id=>cells.delete(id),mountRef:useObservedRef,mountState:useObservedState})', {
     __previewIncremental: incremental, accepts, equal, comparison, checkpointValidation, reconcile, restoration, retainedCells, encodeValues, decodeValues, crypto,
     history: { state: { route: '/' }, replaceState() {} },
     location: { pathname: '/', search: '', hash: '', origin: 'https://localhost:4511', href: 'https://localhost:4511/' },
     addEventListener() {}, performance, URL, DOMException,
     structuredClone(value: unknown) { clones++; return structuredClone(value) },
     document: { querySelectorAll() { if (!allowCapture) throw new Error('Restoration must not capture the destination'); return [] } },
+    useRef: (current: Value) => ({ current }),
+    useState: (initial: Value | (() => Value)) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useLayoutEffect: (effect: () => void) => effect(),
     flushSync(callback: () => void) { callback(); afterCommit(++commits) },
   }) as Runtime
   return { runtime, counts: () => ({ commits, clones }) }
@@ -257,4 +260,79 @@ test('incremental repair observes effect writes after each commit and retains al
   expect(report.retained).toBe(1)
   expect(report.secondPass).toEqual(['feed'])
   expect(report.changed).toEqual(['feed'])
+})
+
+
+test('ambiguous destination owners stay local through remounts without blocking a draft or poisoning the next capture', () => {
+  const draft = cell('draft', 'state', ''), drag = cell('drag', 'ref', false), otherDrag = cell('drag', 'ref', false)
+  const mode = cell('mode', 'state', 'local'), otherMode = cell('mode', 'state', 'other local')
+  let remounted: { current: Value } | undefined, remountedState: { value: Value } = { value: null }
+  const { runtime } = harness(pass => {
+    if (pass !== 1) return
+    runtime.remove('drag'); runtime.remove('mode')
+    remounted = runtime.mountRef('drag', data, false)
+    ;[remountedState.value] = runtime.mountState('mode', data, 'new local')
+  }, true)
+  for (const entry of [draft, drag, mode]) runtime.register(entry.cell)
+  runtime.duplicate(otherDrag.cell); runtime.duplicate(otherMode.cell)
+  const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
+    { id: 'draft', kind: 'state', value: 'keep my draft' },
+    { id: 'drag', kind: 'ref', value: true },
+    { id: 'mode', kind: 'state', value: 'incoming mode' },
+  ] })
+  expect(draft.cell.read()).toBe('keep my draft')
+  expect(report.rejected).toEqual([])
+  expect(report.restored).toEqual(['draft'])
+  expect(report.skipped).toEqual([
+    { id: 'drag', reason: 'multiple instances', count: 2 },
+    { id: 'mode', reason: 'multiple instances', count: 2 },
+  ])
+  expect([drag.writes(), otherDrag.writes(), mode.writes(), otherMode.writes()]).toEqual([0, 0, 0, 0])
+  expect(remounted!.current).toBe(false)
+  expect(remountedState.value).toBe('new local')
+  expect(report.changed).toEqual([])
+  expect(runtime.capture().values.find(saved => saved.id === 'drag')).toEqual({ id: 'drag', kind: 'ref', value: false })
+})
+
+test('rejections distinguish hook kind, incoming shape and live resources before writing any accepted cell', () => {
+  const draft = cell('draft', 'state', 'local'), count = cell('count', 'state', 0)
+  count.cell.schema = { root: 0, nodes: [{ kind: 'primitive', name: 'number' }] }
+  const resource = cell('resource', 'ref', new AbortController() as unknown as Value)
+  const wrongKind = cell('kind', 'ref', false)
+  const { runtime, counts } = harness()
+  for (const entry of [draft, count, resource, wrongKind]) runtime.register(entry.cell)
+  const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
+    { id: 'draft', kind: 'state', value: 'incoming' },
+    { id: 'count', kind: 'state', value: 'not a number' },
+    { id: 'resource', kind: 'ref', value: {} },
+    { id: 'kind', kind: 'state', value: false },
+  ] })
+  expect(report.restored).toEqual([])
+  expect(report.rejectionDetails).toEqual([
+    { id: 'count', reason: 'incoming-value-invalid', phase: 'validation' },
+    { id: 'resource', reason: 'live-ref-invalid', phase: 'validation' },
+    { id: 'kind', reason: 'hook-kind-mismatch', phase: 'validation' },
+  ])
+  expect(report.timing.decodeMs).toBeGreaterThanOrEqual(0)
+  expect(report.timing.validationMs).toBeGreaterThanOrEqual(0)
+  expect(report.timing.restoreMs).toBeGreaterThanOrEqual(report.timing.validationMs)
+  expect(draft.cell.read()).toBe('local')
+  expect(counts().commits).toBe(0)
+})
+
+test('new ambiguity after either commit is reported as a failed restore rather than claimed untouched', () => {
+  for (const ambiguousPass of [1, 2]) {
+    const draft = cell('draft', 'state', ''), extra = cell('draft', 'state', 'local')
+    const { runtime } = harness(pass => {
+      if (pass === ambiguousPass) runtime.duplicate(extra.cell)
+      else draft.reset('effect reset')
+    })
+    runtime.register(draft.cell)
+    const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
+      { id: 'draft', kind: 'state', value: 'incoming' },
+    ] })
+    expect(report.rejectionDetails).toEqual([{ id: 'draft', reason: 'multiple-instances-after-commit', count: 2, phase: ambiguousPass === 1 ? 'repair' : 'verification' }])
+    expect(report.skipped).toEqual([])
+    expect(extra.writes()).toBe(0)
+  }
 })
