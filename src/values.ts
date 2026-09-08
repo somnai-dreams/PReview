@@ -66,14 +66,17 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
       // Accessor-backed objects are executable state, not plain checkpoint data.
       if (Object.getOwnPropertySymbols(value).length > 0) return false
       const descriptors = Object.getOwnPropertyDescriptors(value)
-      for (const descriptor of Object.values(descriptors)) if (!('value' in descriptor)) return false
       for (const field of shape.fields) {
-        if (!Object.hasOwn(value, field.name) && field.optional) continue
-        if (!accepts(schema, value[field.name], field.shape, depth + 1)) return false
+        const descriptor = Object.hasOwn(descriptors, field.name) ? descriptors[field.name] : undefined
+        if (descriptor === undefined) {
+          if (!field.optional && !accepts(schema, undefined, field.shape, depth + 1)) return false
+          continue
+        }
+        if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, field.shape, depth + 1)) return false
+        delete descriptors[field.name]
       }
-      for (const key of Object.keys(value)) {
-        if (shape.fields.some(field => field.name === key)) continue
-        if (shape.index === null || !accepts(schema, value[key], shape.index, depth + 1)) return false
+      for (const descriptor of Object.values(descriptors)) {
+        if (shape.index === null || !('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, shape.index, depth + 1)) return false
       }
       return true
     }
@@ -82,7 +85,9 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
 
 // Ordered collection equality matches iteration-visible UI state. The two maps
 // also check shared-object identity: equal fields with broken aliases differ.
-export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(), reverse = new Map<object, object>(), copies?: Restoration['copies']): boolean {
+// knownSource is reserved for previously validated, owned checkpoint data. The
+// live destination still receives descriptor/prototype checks on every visit.
+export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(), reverse = new Map<object, object>(), copies?: Restoration['copies'], knownSource = false): boolean {
   if (Object.is(a, b)) return true
   if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
   const restored = copies?.get(a)
@@ -94,39 +99,55 @@ export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(),
   reverse.set(b, a)
   if (a instanceof Map || b instanceof Map) {
     if (!(a instanceof Map) || !(b instanceof Map) || Object.getPrototypeOf(a) !== Map.prototype
-      || Object.getPrototypeOf(b) !== Map.prototype || a.size !== b.size) return false
-    return equal([...a], [...b], pairs, reverse, copies)
+      || Object.getPrototypeOf(b) !== Map.prototype || Reflect.ownKeys(a).length !== 0 || Reflect.ownKeys(b).length !== 0 || a.size !== b.size) return false
+    const other = b.entries()
+    for (const [key, value] of a) {
+      const item = other.next().value!
+      if (!equal(key, item[0], pairs, reverse, copies, knownSource) || !equal(value, item[1], pairs, reverse, copies, knownSource)) return false
+    }
+    return true
   }
   if (a instanceof Set || b instanceof Set) {
     if (!(a instanceof Set) || !(b instanceof Set) || Object.getPrototypeOf(a) !== Set.prototype
-      || Object.getPrototypeOf(b) !== Set.prototype || a.size !== b.size) return false
-    return equal([...a], [...b], pairs, reverse, copies)
+      || Object.getPrototypeOf(b) !== Set.prototype || Reflect.ownKeys(a).length !== 0 || Reflect.ownKeys(b).length !== 0 || a.size !== b.size) return false
+    const other = b.values()
+    for (const value of a) if (!equal(value, other.next().value, pairs, reverse, copies, knownSource)) return false
+    return true
   }
   if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    if (!Array.isArray(a) || !Array.isArray(b) || Object.getPrototypeOf(a) !== Array.prototype || Object.getPrototypeOf(b) !== Array.prototype
+      || a.length !== b.length || Reflect.ownKeys(a).length !== a.length + 1 || Reflect.ownKeys(b).length !== b.length + 1) return false
     for (let index = 0; index < a.length; index++) {
-      const left = Object.getOwnPropertyDescriptor(a, index), right = Object.getOwnPropertyDescriptor(b, index)
-      if (left === undefined || right === undefined || !('value' in left) || !('value' in right)
-        || !equal(left.value, right.value, pairs, reverse, copies)) return false
+      const left = knownSource ? { value: a[index], enumerable: true } : Object.getOwnPropertyDescriptor(a, index), right = Object.getOwnPropertyDescriptor(b, index)
+      if (left === undefined || right === undefined || !('value' in left) || !('value' in right) || !left.enumerable || !right.enumerable
+        || !equal(left.value, right.value, pairs, reverse, copies, knownSource)) return false
     }
     return true
   }
   if (!plain(a) || !plain(b)) return false
-  const keys = Object.keys(a)
-  if (keys.length !== Object.keys(b).length) return false
+  const keys = knownSource ? Object.keys(a) : Reflect.ownKeys(a)
+  if (keys.length !== Reflect.ownKeys(b).length) return false
   for (const key of keys) {
-    const left = Object.getOwnPropertyDescriptor(a, key), right = Object.getOwnPropertyDescriptor(b, key)
-    if (left === undefined || right === undefined || !('value' in left) || !('value' in right)
-      || !equal(left.value, right.value, pairs, reverse, copies)) return false
+    if (typeof key !== 'string') return false
+    const left = knownSource ? { value: a[key], enumerable: true } : Object.getOwnPropertyDescriptor(a, key), right = Object.getOwnPropertyDescriptor(b, key)
+    if (left === undefined || right === undefined || !('value' in left) || !('value' in right) || !left.enumerable || !right.enumerable
+      || !equal(left.value, right.value, pairs, reverse, copies, knownSource)) return false
   }
   return true
 }
 
 export type Restoration = { copies: Map<object, { value: Container; pass: number }>; claimed: Set<object>; pass: number }
-export function restoration(): Restoration { return { copies: new Map(), claimed: new Set(), pass: 0 } }
+export function restoration(matches = new Map<object, object>()): Restoration {
+  const context: Restoration = { copies: new Map(), claimed: new Set(), pass: 0 }
+  for (const [source, target] of matches) {
+    context.copies.set(source, { value: target as Container, pass: 0 })
+    context.claimed.add(target)
+  }
+  return context
+}
 
 export function matchesRestoration(source: Value, current: unknown, context: Restoration): boolean {
-  return equal(source, current, new Map(), new Map(), context.copies)
+  return equal(source, current, new Map(), new Map(), context.copies, true)
 }
 
 // Reuse mutable destination containers so closures and memoized consumers keep

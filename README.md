@@ -69,9 +69,11 @@ The compiler reads the checkout's `tsconfig.json` and examines source files unde
 
 The runtime records mounted values and setters. It skips ambiguous repeated instances, clones accepted values, and restores them through normal React updates. A pending checkpoint also initializes newly mounted observed components. The destination validates one transfer plan, commits it, then repairs only cells changed by mounting or effects. Both passes share the restored object graph, so repaired cells retain aliases to unchanged refs. The acknowledgement contains cell identities, outcomes and timings; it does not recapture or return the destination state.
 
+Each frame retains one complete checkpoint. Warm captures compare current values against it, validate changed cells, and send only those changes. New cells can refer into unchanged checkpoint data; references use a separate object-identity table, so application property names cannot collide with the protocol. The destination checks its live data too: hidden-build drift is repaired or rejected, rather than assumed unchanged. A missing checkpoint, including on a third build or after reload, requests a full transfer. Checkpoints and their lookup tables stay in page memory and are replaced by the next checkpoint; there is no persistent snapshot history.
+
 Refs are read from their current value at capture time, including in-place mutations since the last render. The checkpoint is cloned as one graph to retain shared references. Restoration reuses compatible mutable destination containers and schedules their owners to render, so existing Map references and memoized consumers continue to see changes. Read-only or incompatible containers are replaced. Pure handle refs stay local, including null DOM refs and empty callback arrays. Data containers may include unsupported optional or union branches, but their complete current values must validate at both ends; no fields are stripped.
 
-No application source or runtime state is uploaded by PReview. State is exchanged directly between the localhost frames and their parent via `postMessage`. Debug snapshots remain accessible in the reviewer's page memory as `window.lastTransfer`.
+No application source or runtime state is uploaded by PReview. State is exchanged directly between the localhost frames and their parent via `postMessage`. The latest transfer packet remains accessible in the reviewer's page memory as `window.lastTransfer`. Warm packets contain references and are not standalone snapshots.
 
 ## Current limits
 
@@ -84,6 +86,7 @@ No application source or runtime state is uploaded by PReview. State is exchange
 - Scroll restoration handles scroll containers with unique element IDs. It first tries a visible link anchor, then falls back to pixels. It does not make independently loaded feeds identical.
 - Route preparation and restoration explicitly flush React commits, so hidden builds do not depend on animation frames. This does not wait for application-specific asynchronous work; later effects or responses may overwrite restored state. A failed restore can leave the hidden destination partially updated; there is no transaction rollback.
 - Copyable data can still represent a request flag, timer ID or mutation receipt. The observer does not infer all of these meanings from a primitive type. Restore between settled builds; ref support does not move in-flight work or provide execution-state migration.
+- Warm comparisons still inspect mutable data to catch changes made without rendering. Large changed cells and builds without a shared checkpoint can still require a full transfer. This is not constant-time synchronization.
 - Builds remain mounted, so their effects, network connections and memory use remain active. This is not a suspension mechanism. Bundle generation runs once at startup; hot reload is not implemented.
 
 ## Trust and authentication

@@ -1,26 +1,28 @@
 import { expect, test } from 'bun:test'
 import { runInNewContext } from 'node:vm'
 import { accepts, equal, matchesRestoration, reconcile, restoration, type Schema, type Value } from './values'
+import { retainedCells, encodeValues, decodeValues } from './checkpoint'
 
 const runtimeSource = (await Bun.file(new URL('./runtime.js', import.meta.url)).text())
   .replace(/^import .*$/gm, '').replaceAll('export function ', 'function ')
 
 type Cell = { id: string; kind: 'ref' | 'state'; schema: Schema; read: () => Value; write: (next: Value) => void }
 type Saved = { id: string; kind: Cell['kind']; value: Value }
-type Report = { restored: string[]; rejected: string[]; absent: string[]; secondPass?: string[]; changed?: string[] }
-type Runtime = { register: (cell: Cell) => void; restore: (snapshot: { values: Saved[]; scroll: never[]; history: typeof journal }) => Report }
+type Packet = { id: string; base: string | null; values: (Saved | { id: string; kind: Cell['kind']; reuse: true })[]; references?: { marker: object; cell: number; path: unknown[] }[]; scroll: never[]; history: typeof journal }
+type Report = { restored: string[]; rejected: string[]; absent: string[]; secondPass?: string[]; changed?: string[]; retained?: number; transferred?: number; needsFull?: boolean }
+type Runtime = { register: (cell: Cell) => void; restore: (snapshot: Packet) => Report; capture: () => Packet; full: () => Packet }
 const journal = { entries: [{ state: { route: '/' }, path: '/' }], index: 0 }
 const data: Schema = { root: 0, nodes: [{ kind: 'data' }] }
 
-function harness(afterCommit: (pass: number) => void = () => {}) {
+function harness(afterCommit: (pass: number) => void = () => {}, allowCapture = false) {
   let commits = 0, clones = 0
-  const runtime = runInNewContext(runtimeSource + '\n;({restore,register:cell=>cells.set(cell.id,[cell])})', {
-    accepts, equal, matchesRestoration, reconcile, restoration,
+  const runtime = runInNewContext(runtimeSource + '\n;({restore,capture,full:()=>({...checkpoint.snapshot,id:checkpoint.id,base:null,references:[]}),register:cell=>cells.set(cell.id,[cell])})', {
+    accepts, equal, matchesRestoration, reconcile, restoration, retainedCells, encodeValues, decodeValues, crypto,
     history: { state: { route: '/' }, replaceState() {} },
     location: { pathname: '/', search: '', hash: '', origin: 'https://localhost:4511', href: 'https://localhost:4511/' },
     addEventListener() {}, performance, URL, DOMException,
     structuredClone(value: unknown) { clones++; return structuredClone(value) },
-    document: { querySelectorAll() { throw new Error('Restoration must not capture the destination') } },
+    document: { querySelectorAll() { if (!allowCapture) throw new Error('Restoration must not capture the destination'); return [] } },
     flushSync(callback: () => void) { callback(); afterCommit(++commits) },
   }) as Runtime
   return { runtime, counts: () => ({ commits, clones }) }
@@ -44,7 +46,7 @@ test('restore repairs reset and newly mounted cells without rewriting settled ce
   })
   runtime.register(stable.cell)
   runtime.register(draft.cell)
-  const report = runtime.restore({ history: journal, scroll: [], values: [
+  const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
     { id: 'feed', kind: 'ref', value: new Map([['one', { title: 'saved' }]]) },
     { id: 'draft', kind: 'state', value: 'saved draft' },
     { id: 'child', kind: 'state', value: 'saved child' },
@@ -68,7 +70,7 @@ test('repair retains aliases to refs that do not need a second write', () => {
   runtime.register(feed.cell)
   runtime.register(selected.cell)
   const row = { title: 'saved' }
-  const report = runtime.restore({ history: journal, scroll: [], values: [
+  const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
     { id: 'feed', kind: 'ref', value: new Map([['one', row]]) },
     { id: 'selected', kind: 'state', value: row },
   ] })
@@ -82,13 +84,87 @@ test('a settled restoration needs one commit and an incompatible value needs non
   const draft = cell('draft', 'state', '')
   const { runtime, counts } = harness()
   runtime.register(draft.cell)
-  const first = runtime.restore({ history: journal, scroll: [], values: [{ id: 'draft', kind: 'state', value: 'saved' }] })
+  const first = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [{ id: 'draft', kind: 'state', value: 'saved' }] })
   expect(first.secondPass).toEqual([])
   expect(counts()).toEqual({ commits: 1, clones: 1 })
   draft.cell.schema = { root: 0, nodes: [{ kind: 'primitive', name: 'number' }] }
-  const rejected = runtime.restore({ history: journal, scroll: [], values: [{ id: 'draft', kind: 'state', value: 'incompatible' }] })
+  const rejected = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [{ id: 'draft', kind: 'state', value: 'incompatible' }] })
   expect(rejected.rejected).toEqual(['draft'])
   expect(rejected).not.toHaveProperty('current')
   expect(draft.writes()).toBe(1)
   expect(counts()).toEqual({ commits: 1, clones: 1 })
+})
+
+test('warm round trips send a changed draft without copying or writing the unchanged feed', () => {
+  const a = harness(undefined, true), b = harness(undefined, true)
+  const aFeed = cell('feed', 'ref', new Map([['one', { title: 'saved' }]])), bFeed = cell('feed', 'ref', new Map())
+  const aDraft = cell('draft', 'state', 'first'), bDraft = cell('draft', 'state', '')
+  for (const item of [aFeed, aDraft]) a.runtime.register(item.cell)
+  for (const item of [bFeed, bDraft]) b.runtime.register(item.cell)
+  expect(b.runtime.restore(a.runtime.capture()).transferred).toBe(2)
+  bDraft.reset('typed in B')
+  const delta = b.runtime.capture()
+  expect(delta.values.find(saved => saved.id === 'feed')).toEqual({ id: 'feed', kind: 'ref', reuse: true })
+  const report = a.runtime.restore(structuredClone(delta))
+  expect(report.retained).toBe(1)
+  expect(report.transferred).toBe(1)
+  expect(aFeed.writes()).toBe(0)
+  expect(aDraft.cell.read()).toBe('typed in B')
+  expect(b.runtime.restore(structuredClone(a.runtime.capture())).retained).toBe(2)
+  expect(bFeed.writes()).toBe(1)
+  expect(bDraft.writes()).toBe(1)
+})
+
+test('warm restore repairs hidden destination drift and rejects resources before writing', () => {
+  const a = harness(undefined, true), b = harness(undefined, true)
+  const aFeed = cell('feed', 'ref', { count: 1 }), bFeed = cell('feed', 'ref', { count: 0 })
+  a.runtime.register(aFeed.cell); b.runtime.register(bFeed.cell)
+  b.runtime.restore(a.runtime.capture())
+  aFeed.reset({ count: 99 })
+  expect(a.runtime.restore(b.runtime.capture()).retained).toBe(0)
+  expect(aFeed.cell.read()).toEqual({ count: 1 })
+  b.runtime.restore(a.runtime.capture())
+  aFeed.reset(new AbortController() as unknown as Value)
+  expect(a.runtime.restore(b.runtime.capture()).rejected).toEqual(['feed'])
+  expect(aFeed.writes()).toBe(1)
+})
+
+test('changed shared refs transfer together and a third build requests the complete checkpoint', () => {
+  const a = harness(undefined, true), b = harness(undefined, true), c = harness(undefined, true)
+  const row = { title: 'saved' }
+  const aFeed = cell('feed', 'ref', new Map([['one', row]])), aSelected = cell('selected', 'state', row)
+  a.runtime.register(aFeed.cell); a.runtime.register(aSelected.cell)
+  const bFeed = cell('feed', 'ref', new Map()), bSelected = cell('selected', 'state', null)
+  b.runtime.register(bFeed.cell); b.runtime.register(bSelected.cell)
+  b.runtime.restore(a.runtime.capture())
+  ;(bSelected.cell.read() as typeof row).title = 'mutated without render'
+  const delta = b.runtime.capture()
+  expect(delta.values.every(saved => !('reuse' in saved))).toBe(true)
+  expect(a.runtime.restore(delta).transferred).toBe(2)
+  expect(aSelected.cell.read()).toBe((aFeed.cell.read() as Map<string, Value>).get('one'))
+  const cFeed = cell('feed', 'ref', new Map()), cSelected = cell('selected', 'state', null)
+  c.runtime.register(cFeed.cell); c.runtime.register(cSelected.cell)
+  expect(c.runtime.restore(a.runtime.capture()).needsFull).toBe(true)
+  expect(cFeed.writes()).toBe(0)
+  expect(c.runtime.restore(a.runtime.full()).transferred).toBe(2)
+  expect(cSelected.cell.read()).toEqual({ title: 'mutated without render' })
+  expect(cSelected.cell.read()).toBe((cFeed.cell.read() as Map<string, Value>).get('one'))
+})
+
+test('a newly mounted alias uses the retained graph through an actual cloned message', () => {
+  const a = harness(undefined, true), b = harness(undefined, true)
+  const aFeed = cell('feed', 'ref', [{ title: 'saved' }]), bFeed = cell('feed', 'ref', [])
+  a.runtime.register(aFeed.cell); b.runtime.register(bFeed.cell)
+  b.runtime.restore(structuredClone(a.runtime.capture()))
+  const aSelected = cell('selected', 'ref', null), bSelected = cell('selected', 'ref', (bFeed.cell.read() as Value[])[0])
+  a.runtime.register(aSelected.cell); b.runtime.register(bSelected.cell)
+  const delta = b.runtime.capture()
+  expect(delta.references).toHaveLength(1)
+  expect(delta.values.find(saved => saved.id === 'feed')).toHaveProperty('reuse', true)
+  const report = a.runtime.restore(structuredClone(delta))
+  expect(report.retained).toBe(1)
+  expect(aFeed.writes()).toBe(0)
+  expect(aSelected.cell.read()).toBe((aFeed.cell.read() as Value[])[0])
+  ;(aSelected.cell.read() as { title: string }).title = 'continued edit'
+  expect((aFeed.cell.read() as { title: string }[])[0]!.title).toBe('continued edit')
 })

@@ -1,6 +1,7 @@
 import { useState, useLayoutEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
 import { accepts, equal, matchesRestoration, reconcile, restoration } from './values'
+import { retainedCells, encodeValues, decodeValues } from './checkpoint'
 
 // Replaced by the external bundler for this comparison host.
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
@@ -8,6 +9,7 @@ const cells = new Map()
 let markMounted
 const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
+let checkpoint = null
 let interacted = false
 for (const type of ['pointerdown','keydown','input']) addEventListener(type,event=>{if(event.isTrusted)interacted=true},{capture:true})
 function publishNavigation() {
@@ -100,16 +102,26 @@ export function useObservedRef(id, schema, initial) {
 function capture() {
   const started = performance.now()
   const values = [], skipped = []
+  const candidates = []
+  for (const [id, instances] of cells) {
+    if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
+  }
+  const previous = checkpoint === null ? [] : checkpoint.snapshot.values.map(saved => ({ ...saved, owner: checkpoint.owners.get(saved.id) }))
+  const { retained, reverse } = checkpoint === null ? { retained: new Set(), reverse: new Map() } : retainedCells(previous, candidates)
+  const comparisonMs = performance.now() - started
+  const priorValues = new Map(previous.map(saved => [saved.id, saved]))
+  const owners = new Map()
   for (const [id, instances] of cells) {
     if (instances.length !== 1) { skipped.push({ id, reason: 'multiple instances', count: instances.length }); continue }
     const cell = instances[0]
     const value = cell.read()
-    if (!accepts(cell.schema, value)) {
+    if (!retained.has(id) && !accepts(cell.schema, value)) {
       const root = cell.schema.nodes[cell.schema.root]
       skipped.push({ id, reason: root.kind === 'reject' ? root.reason : 'unsupported value or type' })
       continue
     }
     values.push({ id, kind: cell.kind, value })
+    owners.set(id, cell)
   }
   const scroll = []
   const elements = [...document.querySelectorAll('[id]')]
@@ -128,26 +140,62 @@ function capture() {
     }
     scroll.push({ id: element.id, top: element.scrollTop, left: element.scrollLeft, anchor })
   }
-  // Clone the complete graph once, retaining shared references across cells.
-  const snapshot = structuredClone({ values, skipped, scroll, history: navigation })
+  // Copy changed data and reconnect its references to the retained checkpoint.
+  const changedValues = values.filter(saved => !retained.has(saved.id))
+  const baseObjects = checkpoint?.snapshot.values.map(saved => saved.value) ?? []
+  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, reverse)
+  const decoded = decodeValues(encoded.values, encoded.references, baseObjects)
+  const snapshot = structuredClone({ skipped, scroll, history: navigation })
+  snapshot.values = changedValues.map((saved, index) => ({ ...saved, value: decoded[index] }))
+  const changed = new Map(snapshot.values.map(saved => [saved.id, saved]))
+  const encodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: encoded.values[index] }]))
+  const entries = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, reuse: true } : encodedById.get(saved.id))
+  snapshot.values = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, value: priorValues.get(saved.id).value } : changed.get(saved.id))
   snapshot.captureMs = performance.now() - started
-  return snapshot
+  snapshot.comparisonMs = comparisonMs
+  const base = checkpoint?.id ?? null, id = crypto.randomUUID()
+  checkpoint = { id, snapshot, owners }
+  return { ...snapshot, values: entries, references: encoded.references, base, id }
 }
 
-function restore(snapshot) {
+function restore(packet) {
+  if (typeof packet.id !== 'string' || !(packet.base === null || typeof packet.base === 'string')) throw new Error('Invalid checkpoint identity')
+  if (packet.base === null && (packet.values.some(saved => saved.reuse === true) || packet.references?.length)) throw new Error('A full checkpoint cannot contain references')
+  if (packet.base !== null && checkpoint?.id !== packet.base) return { needsFull: true }
+  const changedValues = packet.values.filter(saved => saved.reuse !== true)
+  const decoded = decodeValues(changedValues.map(saved => saved.value), packet.references ?? [], checkpoint?.snapshot.values.map(saved => saved.value) ?? [])
+  const decodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: decoded[index] }]))
+  const old = new Map(checkpoint?.snapshot.values.map(saved => [saved.id, saved]) ?? [])
+  const reused = new Set()
+  const values = packet.values.map(saved => {
+    if (saved.reuse !== true) return decodedById.get(saved.id)
+    const previous = old.get(saved.id)
+    if (previous === undefined || previous.kind !== saved.kind) throw new Error('Invalid checkpoint reference')
+    reused.add(saved.id)
+    return previous
+  })
+  const snapshot = { values, scroll: packet.scroll, history: packet.history }
   const started = performance.now()
+  const candidates = []
+  for (const [id, instances] of cells) {
+    if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
+  }
+  const { retained, matches } = reused.size === 0 ? { retained: new Set(), matches: new Map() } : retainedCells(
+    values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? checkpoint.owners.get(saved.id) : saved })), candidates)
   const restored = [], rejected = [], absent = [], plan = []
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances === undefined) { absent.push(saved.id); continue }
-    if (instances.length !== 1 || instances[0].kind !== saved.kind || !accepts(instances[0].schema, saved.value)
+    if (retained.has(saved.id)) { restored.push(saved.id); continue }
+    const validatedBefore = reused.has(saved.id) && checkpoint.owners.get(saved.id) === instances[0]
+    if (instances.length !== 1 || instances[0].kind !== saved.kind || !validatedBefore && !accepts(instances[0].schema, saved.value)
       || saved.kind === 'ref' && !accepts(instances[0].schema, instances[0].read())) { rejected.push(saved.id); continue }
     plan.push({ saved, cell: instances[0] })
     restored.push(saved.id)
   }
   if (rejected.length > 0) return { restored: [], rejected, absent }
   const validated = performance.now()
-  pending = { values: snapshot.values, context: restoration() }
+  pending = { values: snapshot.values, context: restoration(matches) }
   function applyValues(entries) {
     // Validation precedes this synchronous commit. Refs establish canonical
     // container identities before state that may point into the same graph.
@@ -159,7 +207,7 @@ function restore(snapshot) {
     }
   }
   try {
-  flushSync(() => applyValues(plan))
+  if (plan.length > 0) flushSync(() => applyValues(plan))
   const firstCommit = performance.now()
   navigation = structuredClone(snapshot.history)
   const target = navigation.entries[navigation.index]
@@ -172,7 +220,7 @@ function restore(snapshot) {
     if (instances === undefined) continue
     if (instances.length !== 1 || instances[0].kind !== saved.kind) { rejected.push(saved.id); continue }
     const cell = instances[0]
-    const known = plan.some(entry => entry.saved === saved && entry.cell === cell)
+    const known = retained.has(saved.id) && checkpoint.owners.get(saved.id) === cell || plan.some(entry => entry.saved === saved && entry.cell === cell)
     if (!known && !accepts(cell.schema, saved.value)) { rejected.push(saved.id); continue }
     if (matchesRestoration(saved.value, cell.read(), pending.context)) {
       if (!restored.includes(saved.id)) restored.push(saved.id)
@@ -213,7 +261,8 @@ function restore(snapshot) {
     const instances = cells.get(saved.id)
     if (instances?.length === 1 && !matchesRestoration(saved.value, instances[0].read(), pending.context)) changed.push(saved.id)
   }
-  return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored,
+  if (rejected.length === 0) checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
+  return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
     timing: { validationMs: validated - started, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, verificationMs: performance.now() - secondCommit } }
   } finally { pending = null }
 }
@@ -229,6 +278,11 @@ addEventListener('message', async event => {
   switch (message.operation) {
     case 'ready': await firstMount; result = { ready: cells.size > 0 }; break
     case 'capture': result = capture(); break
+    case 'checkpoint': {
+      if (checkpoint === null) throw new Error('No captured checkpoint')
+      result = { ...checkpoint.snapshot, id: checkpoint.id, base: null, references: [] }
+      break
+    }
     case 'prepare': {
       const journal = message.snapshot
       if (!Array.isArray(journal?.entries) || !Number.isSafeInteger(journal.index) || journal.index < 0 || journal.index >= journal.entries.length) return

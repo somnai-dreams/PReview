@@ -122,3 +122,18 @@ test('unknown fields still reject live resources and cyclic graphs', () => {
   cycle.next = cycle
   expect(accepts(schema, cycle)).toBe(false)
 })
+
+test('linear object validation checks required, optional, indexed and hidden fields', () => {
+  const schema: Schema = { root: 0, nodes: [
+    { kind: 'object', fields: [{ name: 'title', optional: false, shape: 1 }, { name: 'extra', optional: true, shape: 1 }], index: null },
+    { kind: 'primitive', name: 'string' },
+  ] }
+  expect(accepts(schema, { title: 'saved' })).toBe(true)
+  expect(accepts(schema, {})).toBe(false)
+  expect(accepts(schema, { title: 'saved', extra: 1 })).toBe(false)
+  expect(accepts(schema, { title: 'saved', unexpected: 'field' })).toBe(false)
+  expect(accepts(schema, Object.defineProperty({}, 'title', { value: 'hidden' }))).toBe(false)
+  schema.nodes[0] = { kind: 'object', fields: [{ name: 'title', optional: false, shape: 1 }], index: 1 }
+  expect(accepts(schema, { title: 'saved', other: 'allowed' })).toBe(true)
+  expect(accepts(schema, { title: 'saved', other: false })).toBe(false)
+})

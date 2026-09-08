@@ -15,6 +15,7 @@ export async function previewPlugin(checkout: string, reviewer: string) {
     .replace("from 'react'", 'from ' + JSON.stringify(appRequire.resolve('react')))
     .replace("from 'react-dom'", 'from ' + JSON.stringify(appRequire.resolve('react-dom')))
     .replace("from './values'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'values.ts')))
+    .replace("from './checkpoint'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'checkpoint.ts')))
     .replace("'__PREVIEW_ORIGIN__'", JSON.stringify(origin))
   const plugin: BunPlugin = {
     name: 'preview-state',
