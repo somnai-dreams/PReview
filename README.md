@@ -23,6 +23,18 @@ The ref controls also exercise a shared object inside a Map and a memoized consu
 
 The self-contained example serves two visual variants of one small React app on ports 4511 and 4512. It needs no account, credentials, external services, or project-specific assets. These variants exercise the integration; they are not a claim of compatibility with every router or application.
 
+### Try accelerated switching
+
+```sh
+bun examples/incremental/serve.ts
+```
+
+Open **http://localhost:4770**. This example enables the optional incremental engine and includes a 20,000-row feed, a draft, shared selection state, and edits made through old aliases and runtime-generated closures. Warm both directions before comparing switch times. Its **Comparison engine** control selects incremental or full checks in the same instrumented builds.
+
+For an ordinary reviewer without write instrumentation, run `PREVIEW_INCREMENTAL=0 PORT=4760 bun examples/incremental/serve.ts`. This is a different control from selecting full checks inside an instrumented build.
+
+The documented synthetic run measured about 23 ms warm switches versus 48 ms without instrumentation. Initial transfers and actual large-feed edits took hundreds of milliseconds. The generated-code parser adds about 4.2 MB minified and took 122–192 ms to load in that fixture; retained heap overhead is not isolated. These results describe this example, not every application. See the [complete measurements and limits](examples/incremental/README.md).
+
 ## Use with another application
 
 Start with two checkouts of the same React/TypeScript application, each with its dependencies installed. Keep the application's existing build configuration in an external launcher. Add the plugin to each browser build:
@@ -63,6 +75,8 @@ An HTTPS reviewer requires HTTPS builds. Certificates and keys are not included.
 
 This setup is once per application, outside its feature code. Individual PRs need no registration, manual state adapters, or source edits. The included launcher is an example, not a replacement for every application's development server.
 
+To enable acceleration in a custom launcher, set `PREVIEW_INCREMENTAL=1` and load the incremental preload before all application code, as the [incremental launcher](examples/incremental/serve.ts) does. The preload requires the plugin's final write-coverage result. Setting the environment variable alone on a launcher without that preload is insufficient.
+
 ## How state is matched
 
 The compiler reads the checkout's `tsconfig.json` and examines source files under `src/`. It finds ordinary destructured `useState` calls and named `useRef` bindings, including their `React.*` spellings. Each cell is identified by its relative source path, owning function, and variable name. Matching identities, hook kinds and destination type validation determine what can transfer.
@@ -75,7 +89,9 @@ Comparisons share their work across refs during each synchronous read phase. Eve
 
 Refs are read from their current value at capture time, including in-place mutations since the last render. The checkpoint is cloned as one graph to retain shared references. Restoration reuses compatible mutable destination containers and schedules their owners to render, so existing Map references and memoized consumers continue to see changes. Read-only or incompatible containers are replaced. Pure handle refs stay local, including null DOM refs and empty callback arrays. Data containers may include unsupported optional or union branches, but their complete current values must validate at both ends; no fields are stripped.
 
-No application source or runtime state is uploaded by PReview. State is exchanged directly between the localhost frames and their parent via `postMessage`. The latest transfer packet remains accessible in the reviewer's page memory as `window.lastTransfer`. Warm packets contain references and are not standalone snapshots.
+The optional incremental engine adds compiler write markers, native mutation observation and interception of runtime-generated functions. It retains verified object correspondences across unchanged roots and confirmed no-op writes. A real change invalidates its root's proof and uses full comparison or copying. Detected eval and unsupported syntax disable acceleration. Code outside the observed bundle and native boundaries can evade it; this is not universal JavaScript mutation tracking.
+
+No application source or runtime state is uploaded by PReview. State is exchanged directly between the localhost frames and their parent via `postMessage`. `window.lastTransfer` contains the latest outcome and timing record, not a standalone snapshot. Checkpoint data remains in the frames' memory.
 
 ## Current limits
 
@@ -88,7 +104,7 @@ No application source or runtime state is uploaded by PReview. State is exchange
 - Scroll restoration handles scroll containers with unique element IDs. It first tries a visible link anchor, then falls back to pixels. It does not make independently loaded feeds identical.
 - Route preparation and restoration explicitly flush React commits, so hidden builds do not depend on animation frames. This does not wait for application-specific asynchronous work; later effects or responses may overwrite restored state. A failed restore can leave the hidden destination partially updated; there is no transaction rollback.
 - Copyable data can still represent a request flag, timer ID or mutation receipt. The observer does not infer all of these meanings from a primitive type. Restore between settled builds; ref support does not move in-flight work or provide execution-state migration.
-- Warm comparisons still inspect mutable data to catch changes made without rendering. Large changed cells and builds without a shared checkpoint can still require a full transfer. This is not constant-time synchronization.
+- Ordinary warm comparisons inspect mutable data to catch changes made without rendering. The optional incremental engine can reuse verified unchanged roots within its observation boundary. Large changed cells and builds without a shared checkpoint can still require a full transfer. This is not constant-time synchronization.
 - Builds remain mounted, so their effects, network connections and memory use remain active. This is not a suspension mechanism. Bundle generation runs once at startup; hot reload is not implemented.
 
 ## Trust and authentication
@@ -105,10 +121,12 @@ PReview does not copy cookies, localStorage or sessionStorage and does not imple
 bun check
 ```
 
-This runs the compiler regression test, strict TypeScript checks for the TypeScript sources, and linting. The browser runtime and inline host script are JavaScript; the TypeScript check does not cover them. Runtime regression tests exercise the actual restore code with controlled commit callbacks, including selective repairs and compact results. Browser checks exercise the real React renderer and remain manual in this initial version.
+This runs the regression suite, strict TypeScript checks for the TypeScript sources, and linting. The browser runtime and inline host script are JavaScript; the TypeScript check does not cover them. Runtime regression tests exercise the actual restore code with controlled commit callbacks, including selective repairs and compact results. Browser checks exercise the real React renderer.
 
 The value tests cover Map and tuple validation, container identity, shared references, subsequent mutation, and rejection of executable data. See [architecture notes](docs/architecture.md) for the compiler-versus-fiber tradeoff.
 
 The reviewer enables a build after its observer has mounted, reports failed route preparation and runtime errors, and keeps the source visible when destination validation rejects the checkpoint. This initial mount check does not mean all network activity has settled. The programmatic `startReviewer` API takes `builds: [{ url, label }, ...]`; the CLI uses origins as labels.
 
 The package uses TypeScript 5 for its compiler API and TypeScript 7 for checking. React and React DOM resolve from the target application's dependencies when integrating the plugin. This repository is used from source; it is not published to npm.
+
+The working compiler, runtime, host and incremental engine live in `src/`; runnable demonstrations live in `examples/`. Retired fiber and shadow-observer investigations are preserved in Git history and are not part of the library tree.

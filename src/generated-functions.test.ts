@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { observeGeneratedFunctions } from './generated-functions'
 import { incrementalCache } from './incremental'
 import { comparison } from './values'
-import { instrumentWrites } from '../experiments/writes/compiler'
+import { instrumentWrites } from './write-compiler'
 
 const bridge = globalThis as typeof globalThis & { __previewWrites?: { touch: ReturnType<typeof incrementalCache>['touch']; unobserved: () => void } }
 function observe<T>(run: (cache: ReturnType<typeof incrementalCache>, generated: ReturnType<typeof observeGeneratedFunctions>) => T): T {
@@ -90,7 +90,7 @@ test('async and generator constructors are covered through their prototype alias
 
 test('capability checks and ordinary constructors do not disable observation', () => observe((cache, generated) => {
   expect(new Function('')()).toBeUndefined()
-  const result = instrumentWrites('example.js', 'new input.constructor(3)', true)
+  const result = instrumentWrites('example.js', 'new input.constructor(3)')
   expect(result.opaque).toBe(0)
   expect(cache.stats().coverage).toBe(true)
   expect(generated.stats().transformed).toBe(0)

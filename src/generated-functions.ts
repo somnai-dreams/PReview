@@ -1,4 +1,4 @@
-import { instrumentGeneratedFunction } from '../experiments/writes/compiler'
+import { instrumentGeneratedFunction } from './write-compiler'
 
 // Install before application code so aliases and .constructor use the same
 // boundary. Application objects and returned functions are not proxied.

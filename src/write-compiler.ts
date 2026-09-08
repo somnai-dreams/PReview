@@ -3,7 +3,7 @@ import ts from 'typescript'
 // Mark the receiver, leaving JavaScript's original write expression intact.
 // This preserves evaluation order, compound/postfix results, destructuring,
 // await/yield and aliases. No application object is wrapped or replaced.
-export function instrumentWrites(path: string, text: string, generatedFunctions = false) {
+export function instrumentWrites(path: string, text: string) {
   const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, path.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
   const targets = new Map<ts.Expression, string | number | null>()
   const opaque: ts.Expression[] = []
@@ -35,13 +35,7 @@ export function instrumentWrites(path: string, text: string, generatedFunctions 
       const expression = node.expression
       const name = ts.isIdentifier(expression) ? expression.text : ts.isPropertyAccessExpression(expression) ? expression.name.text
         : ts.isElementAccessExpression(expression) && ts.isStringLiteral(expression.argumentExpression) ? expression.argumentExpression.text : ''
-      if (name === 'eval' || !generatedFunctions && (name === 'Function' || name === 'constructor')) {
-        const args = node.arguments
-        const body = args?.length === 1 && args[0] !== undefined && ts.isStringLiteral(args[0]) ? ts.createSourceFile('generated.js', args[0].text, ts.ScriptTarget.Latest) : undefined
-        const statement = body?.statements.length === 1 ? body.statements[0] : undefined
-        const lookup = name === 'Function' && statement !== undefined && ts.isReturnStatement(statement) && statement.expression?.kind === ts.SyntaxKind.ThisKeyword
-        if (!lookup) opaque.push(node)
-      }
+      if (name === 'eval') opaque.push(node)
     }
     if (ts.isWithStatement(node)) unsupported++
     if (ts.isIdentifier(node) && node.text === 'globalThis') {
@@ -83,7 +77,7 @@ export function instrumentWrites(path: string, text: string, generatedFunctions 
 // Native Function#toString supplies the complete parameter/body syntax. Parse
 // parameters too: default arguments can mutate existing objects before the body.
 export function instrumentGeneratedFunction(text: string) {
-  const transformed = instrumentWrites('generated.js', text, true)
+  const transformed = instrumentWrites('generated.js', text)
   if (transformed.unsupported !== 0) return { kind: 'unsupported' as const }
   if (transformed.code === text) return { kind: 'unchanged' as const }
   const source = ts.createSourceFile('generated.js', transformed.code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)

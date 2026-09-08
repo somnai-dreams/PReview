@@ -7,7 +7,7 @@
   "scripts": {
     "demo": "bun examples/basic/serve.ts",
     "host": "bun src/host.ts",
-    "check": "bun test && tsc && oxlint src examples experiments"
+    "check": "bun test && tsc && oxlint src examples"
   },
   "dependencies": { "typescript": "5.9.3" },
   "devDependencies": {

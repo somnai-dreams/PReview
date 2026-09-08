@@ -1,7 +1,7 @@
 # Incremental comparison experiment
 
-Run `bun experiments/incremental/serve.ts` and open `http://localhost:4770`.
-For an uninstrumented control, run `PREVIEW_INCREMENTAL=0 PORT=4760 bun experiments/incremental/serve.ts`.
+Run `bun examples/incremental/serve.ts` and open `http://localhost:4770`.
+For an uninstrumented control, run `PREVIEW_INCREMENTAL=0 PORT=4760 bun examples/incremental/serve.ts`.
 The example has 20,000 rows with 2,048 characters each, a draft, and a selection that aliases a feed row. It includes writes through an old raw alias and writes without rendering.
 
 This is opt-in. The normal reviewer continues using full comparison. The host's Comparison engine control can disable the incremental comparator while retaining the same instrumentation, making that a different control from the uninstrumented launch above.

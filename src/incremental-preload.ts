@@ -1,6 +1,6 @@
 import { observeGeneratedFunctions } from './generated-functions'
 import { incrementalCache } from './incremental'
-import { observeNativeWrites } from '../experiments/writes/tracker'
+import { observeNativeWrites } from './native-writes'
 
 declare const __PREVIEW_COMPLETE__: boolean
 const cache = incrementalCache()
