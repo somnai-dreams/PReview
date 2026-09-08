@@ -7,6 +7,7 @@ import { retainedCells, encodeValues, decodeValues } from './checkpoint'
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
 const cells = new Map()
 const validation = checkpointValidation()
+const incremental = globalThis.__previewIncremental ?? null
 let markMounted
 const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
@@ -108,7 +109,7 @@ function capture() {
     if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
   }
   const previous = checkpoint === null ? [] : checkpoint.snapshot.values.map(saved => ({ ...saved, owner: checkpoint.owners.get(saved.id) }))
-  const { retained, reverse } = checkpoint === null ? { retained: new Set(), reverse: new Map() } : retainedCells(previous, candidates)
+  const { retained, reverse } = checkpoint === null ? { retained: new Set(), reverse: new Map() } : retainedCells(previous, candidates, incremental?.phase())
   const comparisonMs = performance.now() - started
   const priorValues = new Map(previous.map(saved => [saved.id, saved]))
   const owners = new Map()
@@ -154,8 +155,10 @@ function capture() {
   const entries = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, reuse: true } : encodedById.get(saved.id))
   snapshot.values = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, value: priorValues.get(saved.id).value } : changed.get(saved.id))
   for (const saved of snapshot.values) validation.remember(owners.get(saved.id).schema, saved.value)
+  incremental?.keep(snapshot.values.map(saved => ({ source: saved.value, target: owners.get(saved.id).read() })))
   snapshot.captureMs = performance.now() - started
   snapshot.comparisonMs = comparisonMs
+  snapshot.incremental = incremental?.stats()
   const base = checkpoint?.id ?? null, id = crypto.randomUUID()
   checkpoint = { id, snapshot, owners }
   return { ...snapshot, values: entries, references: encoded.references, base, id }
@@ -184,7 +187,7 @@ function restore(packet) {
     if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
   }
   const { retained, matches, reverse } = reused.size === 0 ? { retained: new Set(), matches: new Map(), reverse: new Map() } : retainedCells(
-    values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? checkpoint.owners.get(saved.id) : saved })), candidates)
+    values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? checkpoint.owners.get(saved.id) : saved })), candidates, incremental?.phase())
   const restored = [], rejected = [], absent = [], plan = []
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
@@ -199,7 +202,7 @@ function restore(packet) {
   }
   if (rejected.length > 0) return { restored: [], rejected, absent }
   const validated = performance.now()
-  pending = { values: snapshot.values, context: restoration(matches) }
+  pending = { values: snapshot.values, context: restoration(matches, reverse) }
   function applyValues(entries) {
     // Validation precedes this synchronous commit. Refs establish canonical
     // container identities before state that may point into the same graph.
@@ -218,7 +221,7 @@ function restore(packet) {
   nativeReplace(target.state, '', target.path)
   // Mount/reset effects can introduce owners or change restored values. Repair
   // only those cells, preserving the graph identities established above.
-  const repairs = [], repairComparison = comparison(pending.context.copies)
+  const repairs = [], repairComparison = comparison(pending.context.copies, incremental?.phase())
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances === undefined) continue
@@ -243,7 +246,7 @@ function restore(packet) {
   const secondCommit = performance.now()
   // A commit can change any live cell. Without one, this is still the same
   // synchronous read phase: reuse its comparisons before touching scroll.
-  const changed = [], verification = repaired ? comparison(pending.context.copies) : repairComparison
+  const changed = [], verification = repaired ? comparison(pending.context.copies, incremental?.phase()) : repairComparison
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
     if (instances?.length === 1 && !verification.matches(saved.value, instances[0].read())) changed.push(saved.id)
@@ -267,7 +270,8 @@ function restore(packet) {
     scrollRestored.push({id:saved.id,method})
   }
   if (rejected.length === 0) checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
-  return { restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
+  if (rejected.length === 0) incremental?.keep(snapshot.values.flatMap(saved => { const instances = cells.get(saved.id); return instances?.length === 1 && restored.includes(saved.id) && !changed.includes(saved.id) ? [{source:saved.value,target:instances[0].read()}] : [] }))
+  return { incremental: incremental?.stats(), restored, rejected, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
     timing: { validationMs: validated - started, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, verificationMs: performance.now() - secondCommit } }
   } finally { pending = null }
 }
@@ -281,8 +285,14 @@ addEventListener('message', async event => {
   let result
   try {
   switch (message.operation) {
-    case 'ready': await firstMount; result = { ready: cells.size > 0 }; break
+    case 'ready': await firstMount; result = { ready: cells.size > 0, incremental: incremental?.stats() }; break
     case 'capture': result = capture(); break
+    case 'engine': {
+      if (message.snapshot !== 'full' && message.snapshot !== 'incremental') throw new Error('Invalid comparison engine')
+      incremental?.configure(message.snapshot)
+      result = incremental?.stats() ?? { enabled:false, coverage:false }
+      break
+    }
     case 'checkpoint': {
       if (checkpoint === null) throw new Error('No captured checkpoint')
       result = { ...checkpoint.snapshot, id: checkpoint.id, base: null, references: [] }

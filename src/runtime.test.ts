@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { runInNewContext } from 'node:vm'
 import { accepts, equal, comparison, checkpointValidation, reconcile, restoration, type Schema, type Value } from './values'
+import { incrementalCache } from './incremental'
 import { retainedCells, encodeValues, decodeValues } from './checkpoint'
 
 const runtimeSource = (await Bun.file(new URL('./runtime.js', import.meta.url)).text())
@@ -14,10 +15,10 @@ type Runtime = { register: (cell: Cell) => void; restore: (snapshot: Packet) => 
 const journal = { entries: [{ state: { route: '/' }, path: '/' }], index: 0 }
 const data: Schema = { root: 0, nodes: [{ kind: 'data' }] }
 
-function harness(afterCommit: (pass: number) => void = () => {}, allowCapture = false) {
+function harness(afterCommit: (pass: number) => void = () => {}, allowCapture = false, incremental?: ReturnType<typeof incrementalCache>) {
   let commits = 0, clones = 0
   const runtime = runInNewContext(runtimeSource + '\n;({restore,capture,full:()=>({...checkpoint.snapshot,id:checkpoint.id,base:null,references:[]}),register:cell=>cells.set(cell.id,[cell])})', {
-    accepts, equal, comparison, checkpointValidation, reconcile, restoration, retainedCells, encodeValues, decodeValues, crypto,
+    __previewIncremental: incremental, accepts, equal, comparison, checkpointValidation, reconcile, restoration, retainedCells, encodeValues, decodeValues, crypto,
     history: { state: { route: '/' }, replaceState() {} },
     location: { pathname: '/', search: '', hash: '', origin: 'https://localhost:4511', href: 'https://localhost:4511/' },
     addEventListener() {}, performance, URL, DOMException,
@@ -217,4 +218,43 @@ test('verification does not rescan a settled graph when no repair commit occurre
   expect(report.secondPass).toEqual([])
   expect(report.changed).toEqual([])
   expect(reads).toBe(1)
+})
+
+
+test('incremental warm round trips retain feed proofs, transfer edits and repair observed hidden drift', () => {
+  const aCache = incrementalCache(), bCache = incrementalCache()
+  const a = harness(undefined, true, aCache), b = harness(undefined, true, bCache)
+  const original = { count: 1 }, aFeed = cell('feed', 'ref', [original]), bFeed = cell('feed', 'ref', [])
+  const aDraft = cell('draft', 'state', 'first'), bDraft = cell('draft', 'state', '')
+  for (const entry of [aFeed, aDraft]) a.runtime.register(entry.cell)
+  for (const entry of [bFeed, bDraft]) b.runtime.register(entry.cell)
+  b.runtime.restore(structuredClone(a.runtime.capture()))
+  const indexed = aCache.stats().indexedRoots
+  bDraft.reset('changed')
+  const report = a.runtime.restore(structuredClone(b.runtime.capture()))
+  expect(report.retained).toBe(1)
+  expect(report.changed).toEqual([])
+  expect(aFeed.writes()).toBe(0)
+  expect(aDraft.cell.read()).toBe('changed')
+  expect(aCache.stats().indexedRoots).toBe(indexed)
+  expect(aCache.stats().hits).toBeGreaterThan(0)
+  aCache.touch(original, 'property', 'count').count = 3
+  expect(a.runtime.restore(structuredClone(b.runtime.capture())).retained).toBe(1) // The draft stayed unchanged.
+  expect(aFeed.cell.read()).toEqual([{ count: 1 }])
+})
+
+test('incremental repair observes effect writes after each commit and retains alias identity', () => {
+  const aCache = incrementalCache(), bCache = incrementalCache()
+  const aFeed = cell('feed', 'ref', { count: 1 }), aDraft = cell('draft', 'state', 'first')
+  let mutate = false
+  const a = harness(() => { if (mutate) aCache.touch(aFeed.cell.read() as {count:number}, 'property', 'count').count++ }, true, aCache)
+  const b = harness(undefined, true, bCache), bFeed = cell('feed', 'ref', { count: 0 }), bDraft = cell('draft', 'state', '')
+  a.runtime.register(aFeed.cell); a.runtime.register(aDraft.cell)
+  b.runtime.register(bFeed.cell); b.runtime.register(bDraft.cell)
+  b.runtime.restore(structuredClone(a.runtime.capture()))
+  bDraft.reset('edited'); mutate = true
+  const report = a.runtime.restore(structuredClone(b.runtime.capture()))
+  expect(report.retained).toBe(1)
+  expect(report.secondPass).toEqual(['feed'])
+  expect(report.changed).toEqual(['feed'])
 })

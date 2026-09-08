@@ -1,13 +1,13 @@
-import { comparison, type Value } from './values'
+import { comparison, type Value, type PairMap, type ComparisonAcceleration } from './values'
 
 export type Candidate = { id: string; kind: string; value: unknown; owner: object }
 
 // `previous` contains accepted, owned checkpoint data, never live app objects.
 // Reuse only complete matches, with one consistent correspondence across cells.
 // A new cell can then refer into a retained graph without copying that graph.
-export function retainedCells(previous: Candidate[], current: Candidate[]) {
+export function retainedCells(previous: Candidate[], current: Candidate[], acceleration?: ComparisonAcceleration) {
   const before = new Map(previous.map(cell => [cell.id, cell]))
-  const retained = new Set<string>(), checked = comparison()
+  const retained = new Set<string>(), checked = comparison(undefined, acceleration)
   for (const cell of current) {
     const old = before.get(cell.id)
     if (old !== undefined && old.kind === cell.kind && old.owner === cell.owner && checked.matches(old.value, cell.value)) retained.add(cell.id)
@@ -20,7 +20,7 @@ type Reference = { marker: object; cell: number; path: Step[] }
 
 // The marker side table uses object identity, so application data cannot collide
 // with a magic property name. postMessage preserves these identities in its clone.
-export function encodeValues(values: Value[], base: Value[], reusable: Map<object, object>) {
+export function encodeValues(values: Value[], base: Value[], reusable: Pick<PairMap, 'get'>) {
   const references: Reference[] = []
   const copies = new Map<object, Value>(), wanted = new Map<object, Reference>()
   const encoded = values.map(value => copy(value, copies, source => {

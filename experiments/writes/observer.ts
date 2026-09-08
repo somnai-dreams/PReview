@@ -9,6 +9,7 @@ let lastCapture = { cells: 0, predicted: 0, retained: 0, comparisonMs: 0, predic
 observeNativeWrites(tracking.touch)
 const observer = {
   touch: tracking.touch,
+  unobserved() { /* Shadow mode always uses full comparison. */ },
   watch(value: unknown) { return tracking.baseline(undefined, value) },
   unwatch: tracking.release,
   remove(owner: object) { const watch = watches.get(owner); if (watch !== undefined) { tracking.release(watch); watches.delete(owner) } },

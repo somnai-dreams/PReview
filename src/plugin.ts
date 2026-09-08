@@ -11,8 +11,10 @@ export async function previewPlugin(checkout: string, reviewer: string) {
   const root = resolve(checkout)
   const origin = localOrigin(reviewer)
   const { cells, sources } = prepare(root)
+  const fast = process.env['PREVIEW_INCREMENTAL'] === '1'
   const writes = process.env['PREVIEW_WRITE_PROBE'] === '1'
-  const writeCoverage = { modules: 0, dependencies: 0, sites: 0, unsupported: 0 }
+  if (fast && writes) throw new Error('Choose the incremental engine or the older shadow observer')
+  const writeCoverage = { modules: 0, dependencies: 0, sites: 0, unsupported: 0, opaque: 0 }
   const appRequire = createRequire(resolve(root, 'package.json'))
   let runtime = (await Bun.file(new URL('./runtime.js', import.meta.url)).text())
     .replace("from 'react'", 'from ' + JSON.stringify(appRequire.resolve('react')))
@@ -37,7 +39,7 @@ export async function previewPlugin(checkout: string, reviewer: string) {
     const replacements = [
       ['const index = instances.indexOf(cell)', 'globalThis.__previewWrites.remove(cell); const index = instances.indexOf(cell)'],
       ['const scroll = []', 'globalThis.__previewWrites.audit(candidates, values.map(saved => ({...saved, owner: owners.get(saved.id)})), retained, new Set(previous.map(saved => saved.id)), checkpoint !== null, comparisonMs); const scroll = []'],
-      ['return { restored, rejected, absent: absent.filter', 'if (rejected.length === 0) globalThis.__previewWrites.restored(snapshot.values.flatMap(saved => { const owner = cells.get(saved.id)?.[0]; return owner === undefined || !restored.includes(saved.id) ? [] : [{id:saved.id, owner, value:owner.read()}] }), new Set(changed)); return { restored, rejected, absent: absent.filter'],
+      ['return { incremental: incremental?.stats(), restored, rejected, absent: absent.filter', 'if (rejected.length === 0) globalThis.__previewWrites.restored(snapshot.values.flatMap(saved => { const owner = cells.get(saved.id)?.[0]; return owner === undefined || !restored.includes(saved.id) ? [] : [{id:saved.id, owner, value:owner.read()}] }), new Set(changed)); return { incremental: incremental?.stats(), restored, rejected, absent: absent.filter'],
     ]
     for (const [before, after] of replacements) {
       if (!runtime.includes(before!)) throw new Error('Write experiment runtime changed')
@@ -55,9 +57,9 @@ export async function previewPlugin(checkout: string, reviewer: string) {
         // observer: instrumenting the tracker itself would recurse. Include values.ts
         // so restore writes invalidate the same watches as application writes.
         const internal = (path.startsWith(import.meta.dir + '/') && path !== resolve(import.meta.dir, 'values.ts')) || (path.startsWith(resolve(import.meta.dir, '../experiments/writes') + '/') && !path.endsWith('/controls.tsx'))
-        if (!writes || internal) return observed === undefined ? undefined : { contents: observed, loader: path.endsWith('x') ? 'tsx' : 'ts' }
+        if (!(writes || fast) || internal) return observed === undefined ? undefined : { contents: observed, loader: path.endsWith('x') ? 'tsx' : 'ts' }
         const transformed = instrumentWrites(path, observed ?? await Bun.file(path).text())
-        writeCoverage.modules++; writeCoverage.sites += transformed.sites; writeCoverage.unsupported += transformed.unsupported
+        writeCoverage.opaque += transformed.opaque; writeCoverage.modules++; writeCoverage.sites += transformed.sites; writeCoverage.unsupported += transformed.unsupported
         if (path.includes('/node_modules/')) writeCoverage.dependencies++
         return { contents: transformed.code, loader: path.endsWith('x') ? 'tsx' : 'ts' }
       })

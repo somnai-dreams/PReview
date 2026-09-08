@@ -113,3 +113,29 @@ test('unsupported super receivers and a shadowed global are reported without bre
   expect(shadow.code).toBe(source)
   expect(shadow.unsupported).toBe(1)
 })
+
+test('dynamic evaluation falls back before execution and preserves direct eval scope', () => {
+  const events: string[] = []
+  const source = `return () => { let local = 3; eval('local = 7'); return new Function('return 11')() + local }`
+  const result = instrumentWrites('fixture.ts', source)
+  expect(result.opaque).toBe(2)
+  const run = new Function('globalThis', result.code)({__previewWrites: {unobserved() { events.push('fallback') }}}) as () => number
+  expect(events).toEqual([])
+  expect(run()).toBe(18)
+  expect(events).toEqual(['fallback', 'fallback'])
+  const lookup = instrumentWrites('fixture.ts', 'Function("return this")()')
+  expect(lookup.opaque).toBe(0)
+})
+
+test('named field markers preserve evaluation order around opaque receivers', () => {
+  const events: string[] = []
+  const source = 'return x => { x.constructor().count += 2; return x.count }'
+  const result = instrumentWrites('fixture.ts', source)
+  const run = new Function('globalThis', result.code)({__previewWrites: {
+    unobserved() { events.push('fallback') },
+    touch(value: unknown, operation: string, field: string) { events.push(operation + ':' + field); return value },
+  }}) as (x: {count: number; constructor: () => unknown}) => number
+  const target = {count: 1, constructor() { events.push('receiver'); return this }}
+  expect(run(target)).toBe(3)
+  expect(events).toEqual(['fallback', 'receiver', 'property:count'])
+})

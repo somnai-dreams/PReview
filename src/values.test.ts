@@ -18,9 +18,10 @@ test('a failed comparison discards partial mappings but keeps earlier successful
   const source = { count: 1 }, live = { count: 1 }, failed = { count: 2 }
   const phase = comparison()
   expect(phase.matches(source, live)).toBe(true)
-  expect(phase.matches({ stable: source, changed: source }, { stable: live, changed: failed })).toBe(false)
-  expect(phase.pairs.size).toBe(1)
-  expect(phase.reverse.size).toBe(1)
+  const failedSource = { stable: source, changed: source }, failedTarget = { stable: live, changed: failed }
+  expect(phase.matches(failedSource, failedTarget)).toBe(false)
+  expect(phase.pairs.has(failedSource)).toBe(false)
+  expect(phase.reverse.has(failedTarget)).toBe(false)
   expect(phase.matches(source, live)).toBe(true)
   const other = { count: 2 }
   expect(phase.matches(other, failed)).toBe(true)

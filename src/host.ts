@@ -15,7 +15,7 @@ if (options.tls !== undefined && builds.some(url => url.protocol !== 'https:')) 
 const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PReview</title><style>
 *{box-sizing:border-box}body{margin:0;font:14px system-ui;background:#161719;color:#eee}
 header{height:58px;display:flex;align-items:center;gap:12px;padding:12px}
-button{font:inherit;padding:8px 14px;border:1px solid #777;border-radius:7px;background:#292b30;color:inherit;cursor:pointer;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button,select{font:inherit;padding:8px 14px;border:1px solid #777;border-radius:7px;background:#292b30;color:inherit;cursor:pointer;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 button:disabled{opacity:.5;cursor:wait}header strong{flex-shrink:0}
 button[aria-pressed=true]{background:#eef;color:#112}
 iframe{position:absolute;top:58px;left:0;width:100%;height:calc(100vh - 58px);border:0;visibility:hidden}
@@ -27,7 +27,21 @@ const origins = ${JSON.stringify(origins)};
 const urls = ${JSON.stringify(builds.map(url => url.href)).replaceAll('<', '\\u003c')};
 const labels = ${JSON.stringify(options.builds.map(build => build.label)).replaceAll('<', '\\u003c')};
 const header = document.querySelector('header'), status = document.querySelector('#status');
-const frames = [], buttons = [];
+const frames = [], buttons = [], capabilities = [];
+const benchmarkRecords = [];
+const engine = document.createElement('select'); engine.setAttribute('aria-label', 'Comparison engine');
+engine.innerHTML = '<option value="incremental">Incremental</option><option value="full">Full checks</option>'; engine.hidden = true; header.insertBefore(engine, status);
+engine.addEventListener('change', async () => {
+  if (busy) return;
+  busy = true; engine.disabled = true;
+  try {
+    const results = await Promise.all(frames.map((frame, index) => call(index, 'engine', engine.value)));
+    if (engine.value === 'incremental' && results.some(result => !result.enabled)) {
+      await Promise.all(frames.map((frame, index) => call(index, 'engine', 'full')));
+      engine.value = 'full'; status.textContent = 'Full checks required: unobserved code ran';
+    } else status.textContent = engine.value === 'full' ? 'Full checks enabled' : 'Incremental enabled · warm both builds';
+  } catch (error) { status.textContent = error.message; } finally { busy = false; engine.disabled = false; }
+});
 let active = 0, sequence = 0, busy = false;
 const pending = new Map();
 for (let index = 0; index < origins.length; index++) {
@@ -46,6 +60,9 @@ for (let index = 0; index < origins.length; index++) {
       const result = await call(index, 'ready');
       if (!result.ready) throw Error('Application has not mounted');
       button.disabled = false;
+      capabilities[index] = result.incremental;
+      engine.hidden = !buttons.every((button, position) => !button.disabled && capabilities[position] !== undefined);
+      if (!engine.hidden && !capabilities.every(item => item.enabled)) engine.value = 'full';
       status.textContent = buttons.every(button => !button.disabled) ? 'Builds ready · canvas stays local' : 'Connecting to remaining builds…';
     } catch (error) { status.textContent = labels[index] + ': ' + error.message; }
   });
@@ -86,7 +103,7 @@ function call(index, operation, snapshot) {
 }
 async function swap(index) {
   if (index === active || busy) return;
-  busy = true;
+  busy = true; engine.disabled = true;
   const started = performance.now();
   status.textContent = 'Transferring…';
   try {
@@ -98,10 +115,12 @@ async function swap(index) {
       snapshot = await call(active, 'checkpoint');
       result = await call(index, 'restore', snapshot);
     }
-    window.lastTransfer = { source: active, destination: index, snapshot, result, milliseconds: performance.now() - started };
+    const record = { source: active, destination: index, engine: snapshot.incremental?.enabled ? 'incremental' : 'full', result, milliseconds: 0 };
+    window.lastTransfer = record;
     document.querySelector('#details').hidden = false;
-    document.querySelector('#report').textContent = JSON.stringify({ restored: result.restored, absent: result.absent, rejected: result.rejected, secondPass: result.secondPass ?? [], changed: result.changed ?? [], retained: result.retained, transferred: result.transferred, keptLocal: snapshot.skipped, timing: { captureMs: snapshot.captureMs, comparisonMs: snapshot.comparisonMs, ...result.timing } }, null, 2);
+    const report = () => { document.querySelector('#report').textContent = JSON.stringify({ milliseconds: record.milliseconds, engine:record.engine, sourceIndex:snapshot.incremental, destinationIndex:result.incremental, restored: result.restored, absent: result.absent, rejected: result.rejected, secondPass: result.secondPass ?? [], changed: result.changed ?? [], retained: result.retained, transferred: result.transferred, keptLocal: snapshot.skipped, timing: { captureMs: snapshot.captureMs, comparisonMs: snapshot.comparisonMs, ...result.timing }, recent:benchmarkRecords }, null, 2); };
     if (result.rejected.length) {
+      record.milliseconds = performance.now() - started; report();
       status.textContent = 'Rejected ' + result.rejected.length + ' incompatible or ambiguous cells; kept source visible';
       return;
     }
@@ -110,13 +129,18 @@ async function swap(index) {
     active = index;
     frames[active].classList.add('active');
     buttons[active].setAttribute('aria-pressed', 'true');
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    record.milliseconds = performance.now() - started;
+    benchmarkRecords.push({source:record.source,destination:index,engine:record.engine,milliseconds:record.milliseconds,rejected:result.rejected.length,changed:result.changed.length});
+    if (benchmarkRecords.length > 100) benchmarkRecords.shift();
+    report();
     status.textContent = result.restored.length + ' cells · ' + result.absent.length + ' absent · '
       + (result.changed.length ? result.changed.length + ' changed during restore · ' : '')
-      + Math.round(performance.now() - started) + ' ms';
+      + Math.round(record.milliseconds) + ' ms';
   } catch (error) {
     status.textContent = error instanceof Error ? error.message : String(error);
   } finally {
-    busy = false;
+    busy = false; engine.disabled = false;
   }
 }
 </script></body></html>`

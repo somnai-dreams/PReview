@@ -1,3 +1,13 @@
+export type PairMap = { get: (key: object) => object | undefined; has: (key: object) => boolean; set: (key: object, value: object) => void; delete: (key: object) => void }
+export type ComparisonAcceleration = {
+  match: (source: unknown, target: unknown) => boolean
+  get: (source: object) => object | undefined
+  reverse: (target: object) => object | undefined
+  added: (source: object, target: object) => void
+  removed: (source: object, target: object) => void
+}
+type Copies = { get: (source: object) => { value: Container; pass: number } | undefined; set: (source: object, copy: { value: Container; pass: number }) => void; changed: Map<object, { value: Container; pass: number }> }
+
 export type Shape =
   | { kind: 'data' }
   | { kind: 'reject'; reason: string }
@@ -87,7 +97,7 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
 // also check shared-object identity: equal fields with broken aliases differ.
 // knownSource is reserved for previously validated, owned checkpoint data. The
 // live destination still receives descriptor/prototype checks on every visit.
-export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(), reverse = new Map<object, object>(), copies?: Restoration['copies'], knownSource = false, added?: object[]): boolean {
+export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, object>(), reverse: PairMap = new Map<object, object>(), copies?: Restoration['copies'], knownSource = false, added?: object[]): boolean {
   if (Object.is(a, b)) return true
   if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
   const restored = copies?.get(a)
@@ -139,12 +149,26 @@ export function equal(a: unknown, b: unknown, pairs = new Map<object, object>(),
 
 // One synchronous read phase owns this comparison. Discard it before any app
 // writes/commit; successful shared subgraphs can then be visited just once.
-export function comparison(copies?: Restoration['copies']) {
-  const pairs = new Map<object, object>(), reverse = new Map<object, object>()
+export function comparison(copies?: Restoration['copies'], acceleration?: ComparisonAcceleration) {
+  const written = new Map<object, object>(), reversed = new Map<object, object>()
+  if (acceleration !== undefined && copies !== undefined) for (const [source, copy] of copies.changed) acceleration.added(source, copy.value)
+  const pairs: PairMap = {
+    get: key => written.get(key) ?? acceleration?.get(key),
+    has: key => written.has(key) || acceleration?.get(key) !== undefined,
+    set: (key, value) => { written.set(key, value); acceleration?.added(key, value) },
+    delete: key => { const value = written.get(key); if (value !== undefined) acceleration?.removed(key, value); written.delete(key) },
+  }
+  const reverse: PairMap = {
+    get: key => reversed.get(key) ?? acceleration?.reverse(key),
+    has: key => reversed.has(key) || acceleration?.reverse(key) !== undefined,
+    set: (key, value) => { reversed.set(key, value) }, delete: key => { reversed.delete(key) },
+  }
   function matches(source: unknown, current: unknown): boolean {
+    const copy = source !== null && typeof source === 'object' ? copies?.get(source) : undefined
+    if (copy !== undefined && copy.value !== current) return false
+    if (acceleration?.match(source, current)) return true
     const added: object[] = []
     if (equal(source, current, pairs, reverse, copies, true, added)) return true
-    // A failed candidate must not leave a half-compared graph in the result.
     for (const value of added) { reverse.delete(pairs.get(value)!); pairs.delete(value) }
     return false
   }
@@ -170,14 +194,20 @@ export function checkpointValidation() {
   return { accepts: acceptsCopy, remember }
 }
 
-export type Restoration = { copies: Map<object, { value: Container; pass: number }>; claimed: Set<object>; pass: number }
-export function restoration(matches = new Map<object, object>()): Restoration {
-  const context: Restoration = { copies: new Map(), claimed: new Set(), pass: 0 }
-  for (const [source, target] of matches) {
-    context.copies.set(source, { value: target as Container, pass: 0 })
-    context.claimed.add(target)
+export type Restoration = { copies: Copies; claimed: { has: (value: object) => boolean; add: (value: object) => void }; pass: number }
+export function restoration(matches: Pick<PairMap, 'get'> = new Map(), reverse: Pick<PairMap, 'has'> = new Map()): Restoration {
+  const changed: Copies['changed'] = new Map(), claimed = new Set<object>()
+  const copies: Copies = {
+    changed,
+    get(source) {
+      const copy = changed.get(source)
+      if (copy !== undefined) return copy
+      const value = matches.get(source)
+      return value === undefined ? undefined : { value: value as Container, pass: 0 }
+    },
+    set(source, copy) { changed.set(source, copy) },
   }
-  return context
+  return { copies, claimed: { has: value => claimed.has(value) || reverse.has(value), add: value => { claimed.add(value) } }, pass: 0 }
 }
 
 export function matchesRestoration(source: Value, current: unknown, context: Restoration): boolean {
