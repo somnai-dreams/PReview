@@ -56,6 +56,8 @@ const result = await Bun.build({
 
 The launcher owns entry points, HTML, CSS, assets, explicitly public environment values, and any backend proxy. PReview owns state discovery and instrumentation. Keep secret-bearing environment files out of browser defines. Do not bundle the observed runtime into production.
 
+Some styling plugins inspect source through Bun's native parser hooks. PReview's `onLoad` transform can prevent those hooks from seeing application modules; this occurs with `bun-plugin-tailwind` 0.0.15. Generate CSS in a separate build from the untouched application, then serve that CSS with the instrumented JavaScript. Verify the rendered layout when composing build plugins.
+
 Serve each result on a different localhost port, then run:
 
 ```sh
