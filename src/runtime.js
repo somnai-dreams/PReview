@@ -5,6 +5,20 @@ import { retainedCells, encodeValues, decodeValues } from './checkpoint'
 
 // Replaced by the external bundler for this comparison host.
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
+// A deployment may supply an account/environment check. It must reject stale
+// page sessions; credentials never enter the checkpoint or parent frame.
+const authorizeSession = null
+let session = null
+async function checkSession() {
+  if (authorizeSession === null) return
+  const next = await authorizeSession()
+  if (next === null || typeof next !== 'object' || typeof next.account !== 'string' || next.account === '' || typeof next.environment !== 'string' || next.environment === '') throw new Error('Sign in to this build and reload it')
+  if (session !== null && (session.account !== next.account || session.environment !== next.environment)) throw new Error('Build account changed; reload before comparing')
+  session = { account: next.account, environment: next.environment }
+}
+function requireSession(saved) {
+  if (session === null ? saved !== null : saved === null || saved?.account !== session.account || saved?.environment !== session.environment) throw new Error('Build accounts or environments do not match')
+}
 const cells = new Map()
 const validation = checkpointValidation()
 const incremental = globalThis.__previewIncremental ?? null
@@ -15,7 +29,7 @@ let checkpoint = null
 let interacted = false
 for (const type of ['pointerdown','keydown','input']) addEventListener(type,event=>{if(event.isTrusted)interacted=true},{capture:true})
 function publishNavigation() {
-  if (interacted && parent !== window) parent.postMessage({channel:'preview-navigation',history:structuredClone(navigation)},reviewerOrigin)
+  if (interacted && parent !== window) parent.postMessage({channel:'preview-navigation',history:{...structuredClone(navigation),session}},reviewerOrigin)
 }
 
 // An iframe's native session history is joint with every sibling iframe.
@@ -148,7 +162,7 @@ function capture() {
   const baseObjects = checkpoint?.snapshot.values.map(saved => saved.value) ?? []
   const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, reverse)
   const decoded = decodeValues(encoded.values, encoded.references, baseObjects)
-  const snapshot = structuredClone({ skipped, scroll, history: navigation })
+  const snapshot = structuredClone({ skipped, scroll, history: navigation, session })
   snapshot.values = changedValues.map((saved, index) => ({ ...saved, value: decoded[index] }))
   const changed = new Map(snapshot.values.map(saved => [saved.id, saved]))
   const encodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: encoded.values[index] }]))
@@ -284,6 +298,7 @@ addEventListener('message', async event => {
   if (message === null || typeof message !== 'object' || message.channel !== 'preview-state' || !Number.isSafeInteger(message.id)) return
   let result
   try {
+  await checkSession()
   switch (message.operation) {
     case 'ready': await firstMount; result = { ready: cells.size > 0, incremental: incremental?.stats() }; break
     case 'capture': result = capture(); break
@@ -300,6 +315,7 @@ addEventListener('message', async event => {
     }
     case 'prepare': {
       const journal = message.snapshot
+      requireSession(journal?.session)
       if (!Array.isArray(journal?.entries) || !Number.isSafeInteger(journal.index) || journal.index < 0 || journal.index >= journal.entries.length) return
       const target = journal.entries[journal.index]
       if (new URL(target.path,location.href).origin!==location.origin) return
@@ -310,7 +326,7 @@ addEventListener('message', async event => {
         if(instances.length===1&&instances[0].kind==='state'&&accepts(instances[0].schema,instances[0].read())&&equal(instances[0].read(),history.state))owners.push(instances[0])
       }
       if(owners.length!==1||!accepts(owners[0].schema,target.state)){result={navigated:false};break}
-      navigation=structuredClone(journal)
+      navigation={entries:structuredClone(journal.entries),index:journal.index}
       nativeReplace(target.state,'',target.path)
       // Hidden builds may never receive animation frames. Commit the route
       // before acknowledging preparation so newly mounted owners are present.
@@ -320,6 +336,7 @@ addEventListener('message', async event => {
     }
     case 'restore': {
       const snapshot = message.snapshot
+      requireSession(snapshot?.session)
       if (!Array.isArray(snapshot?.values) || snapshot.values.length > 2000 || !Array.isArray(snapshot.scroll) || !Array.isArray(snapshot.history?.entries)) return
       if (!Number.isSafeInteger(snapshot.history.index) || snapshot.history.index < 0 || snapshot.history.index >= snapshot.history.entries.length) return
       for (const entry of snapshot.history.entries) {

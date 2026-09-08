@@ -1,16 +1,17 @@
 import { localURL, localPort } from './local'
+import { buildURL, deploymentOrigin } from './origin'
 
 type ReviewerOptions = { port: number; builds: { url: string; label: string }[]; tls?: { key: string; cert: string } }
 
-export function startReviewer(options: ReviewerOptions) {
-const port = localPort(String(options.port))
-const builds = options.builds.map(build => localURL(build.url))
+// The caller owns authentication and routing. Mount only after its access gate.
+export function reviewerResponse(options: { origin: string; builds: { url: string; label: string }[] }) {
+const ownOrigin = deploymentOrigin(options.origin)
+const builds = options.builds.map(build => buildURL(build.url))
 const origins = builds.map(url => url.origin)
-const ownOrigin = (options.tls === undefined ? 'http' : 'https') + '://localhost:' + port
 if (origins.length < 2 || origins.length > 4 || new Set(origins).size !== origins.length || origins.includes(ownOrigin)) {
   throw new Error('Provide two to four distinct build origins, separate from the reviewer')
 }
-if (options.tls !== undefined && builds.some(url => url.protocol !== 'https:')) throw new Error('An HTTPS reviewer needs HTTPS builds')
+if (ownOrigin.startsWith('https:') && builds.some(url => url.protocol !== 'https:')) throw new Error('An HTTPS reviewer needs HTTPS builds')
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PReview</title><style>
 *{box-sizing:border-box}body{margin:0;font:14px system-ui;background:#161719;color:#eee}
@@ -28,6 +29,8 @@ const urls = ${JSON.stringify(builds.map(url => url.href)).replaceAll('<', '\\u0
 const labels = ${JSON.stringify(options.builds.map(build => build.label)).replaceAll('<', '\\u003c')};
 const header = document.querySelector('header'), status = document.querySelector('#status');
 const frames = [], buttons = [], capabilities = [];
+const reload = document.createElement('button'); reload.textContent = 'Reload builds';
+reload.addEventListener('click', () => { if (!busy) location.reload(); }); header.insertBefore(reload, status);
 const benchmarkRecords = [];
 const engine = document.createElement('select'); engine.setAttribute('aria-label', 'Comparison engine');
 engine.innerHTML = '<option value="incremental">Incremental</option><option value="full">Full checks</option>'; engine.hidden = true; header.insertBefore(engine, status);
@@ -145,13 +148,27 @@ async function swap(index) {
 }
 </script></body></html>`
 
+const script = html.slice(html.indexOf('<script type="module">') + '<script type="module">'.length, html.indexOf('</script>'))
+const hash = new Bun.CryptoHasher('sha256').update(script).digest('base64')
+return (request: Request) => {
+  // A trusted reverse proxy may terminate TLS. Ignore forwarded host headers.
+  if (new URL(request.url).host !== new URL(ownOrigin).host) return new Response('Unexpected host', { status: 403 })
+  return new Response(html, { headers: {
+    'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'; script-src 'sha256-" + hash + "'; style-src 'unsafe-inline'; frame-src " + origins.join(' ') + "; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+  } })
+}
+}
+
+export function startReviewer(options: ReviewerOptions) {
+const port = localPort(String(options.port))
+const ownOrigin = (options.tls === undefined ? 'http' : 'https') + '://localhost:' + port
+const respond = reviewerResponse({ origin: ownOrigin, builds: options.builds.map(build => ({ ...build, url: localURL(build.url).href })) })
 const server = Bun.serve({
   hostname: 'localhost', port,
   ...(options.tls === undefined ? {} : { tls: { key: Bun.file(options.tls.key), cert: Bun.file(options.tls.cert) } }),
-  fetch(request) {
-    if (new URL(request.url).origin !== ownOrigin) return new Response('Unexpected host', { status: 403 })
-    return new Response(html, { headers: { 'content-type': 'text/html' } })
-  },
+  fetch: respond,
 })
 console.log('PReview ready:', ownOrigin)
 return server

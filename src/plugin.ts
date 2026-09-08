@@ -2,14 +2,14 @@ import type { BunPlugin } from 'bun'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { prepare } from './compiler'
-import { localOrigin } from './local'
+import { deploymentOrigin } from './origin'
 import { instrumentWrites } from './write-compiler'
 
 // The caller owns the app's entry points, CSS, public environment, assets and
 // backend. This plugin changes only the source returned to the bundler.
-export async function previewPlugin(checkout: string, reviewer: string) {
+export async function previewPlugin(checkout: string, reviewer: string, options: { sessionModule?: string } = {}) {
   const root = resolve(checkout)
-  const origin = localOrigin(reviewer)
+  const origin = deploymentOrigin(reviewer)
   const { cells, sources } = prepare(root)
   const fast = process.env['PREVIEW_INCREMENTAL'] === '1'
   const writeCoverage = { modules: 0, dependencies: 0, sites: 0, unsupported: 0, opaque: 0 }
@@ -20,6 +20,7 @@ export async function previewPlugin(checkout: string, reviewer: string) {
     .replace("from './values'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'values.ts')))
     .replace("from './checkpoint'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'checkpoint.ts')))
     .replace("'__PREVIEW_ORIGIN__'", JSON.stringify(origin))
+    .replace('const authorizeSession = null', options.sessionModule === undefined ? 'const authorizeSession = null' : 'import { authorizeSession } from ' + JSON.stringify(resolve(options.sessionModule)))
   const plugin: BunPlugin = {
     name: 'preview-state',
     setup(build) {

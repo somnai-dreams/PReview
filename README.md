@@ -71,11 +71,21 @@ TLS_KEY=/path/to/localhost-key.pem TLS_CERT=/path/to/localhost-cert.pem \
   bun host https://localhost:4511/start https://localhost:4512/start
 ```
 
-An HTTPS reviewer requires HTTPS builds. Certificates and keys are not included. All included servers bind to localhost and reject unexpected request hosts. Remote access, tunnels, hosted review sessions and multiplayer are not supported by this package yet.
+An HTTPS reviewer requires HTTPS builds. Certificates and keys are not included. The included launchers bind to localhost and reject unexpected request hosts. Multiplayer is not implemented.
 
 This setup is once per application, outside its feature code. Individual PRs need no registration, manual state adapters, or source edits. The included launcher is an example, not a replacement for every application's development server.
 
 To enable acceleration in a custom launcher, set `PREVIEW_INCREMENTAL=1` and load the incremental preload before all application code, as the [incremental launcher](examples/incremental/serve.ts) does. The preload requires the plugin's final write-coverage result. Setting the environment variable alone on a launcher without that preload is insufficient.
+
+### Mount behind an existing authenticated server
+
+`reviewerResponse({ origin, builds })` from `src/host.ts` creates a request handler for a configured HTTPS reviewer. Call it only after your server's access check. Give each build its own HTTPS origin and pass the reviewer's exact public origin to `previewPlugin`. TLS may terminate at your reverse proxy; the handler checks the configured host and does not trust forwarded host headers. It supplies a restrictive CSP and disables response caching.
+
+The application owns login, access checks on HTML/assets/APIs, and a `frame-ancestors` policy allowing only its reviewer. PReview supplies no public proxy, deployment executor or authentication service.
+
+For account-bound comparisons, pass `{ sessionModule: '/absolute/path/to/session.ts' }` as the plugin's third argument. That browser module exports `authorizeSession()`, returning `{ account: string, environment: string }` or a promise for it. Verify the current server session and reject anonymous users or a changed account relative to the loaded application. The bridge checks it before commands and rejects checkpoints or route preparation from another account/environment before applying state. Credentials must remain inside the application's normal authentication flow. A network-backed check adds its round-trip latency to switching.
+
+Use **Reload builds** after completing sign-in in separate build tabs. These are hosting integration primitives; the generic examples remain local, and deploying trusted builds behind an access gate is the launcher's responsibility.
 
 ## How state is matched
 
@@ -91,7 +101,7 @@ Refs are read from their current value at capture time, including in-place mutat
 
 The optional incremental engine adds compiler write markers, native mutation observation and interception of runtime-generated functions. It retains verified object correspondences across unchanged roots and confirmed no-op writes. A real change invalidates its root's proof and uses full comparison or copying. Detected eval and unsupported syntax disable acceleration. Code outside the observed bundle and native boundaries can evade it; this is not universal JavaScript mutation tracking.
 
-No application source or runtime state is uploaded by PReview. State is exchanged directly between the localhost frames and their parent via `postMessage`. `window.lastTransfer` contains the latest outcome and timing record, not a standalone snapshot. Checkpoint data remains in the frames' memory.
+PReview exchanges state directly between build frames and their parent via `postMessage`; it does not upload checkpoints to a server. `window.lastTransfer` contains the latest outcome and timing record, not a standalone snapshot. Checkpoint data remains in the frames' memory. Hosting application code is a separate deployment step owned by your launcher.
 
 ## Current limits
 
