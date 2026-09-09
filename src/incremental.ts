@@ -1,6 +1,21 @@
 import type { ComparisonAcceleration } from './values'
 
-type Link = { source: object; target: object; parents: Link[]; children: Link[]; roots: number; different: boolean; dirtyChildren: number; differences: Set<PropertyKey> | undefined; fields: Set<PropertyKey> | null | undefined }
+type Link = { source: object; target: object; parents: Edges; children: Edges; roots: number; different: boolean; dirtyChildren: number; differences: Set<PropertyKey> | undefined; fields: Set<PropertyKey> | null | undefined }
+// Most data objects have one parent and zero or one child. Keep those edges
+// directly; allocate a list only for actual branching or shared ownership.
+type Edges = Link | Link[] | undefined
+function edgeCount(edges: Edges) { return edges === undefined ? 0 : Array.isArray(edges) ? edges.length : 1 }
+function edgeAt(edges: Edges, index: number): Link { return Array.isArray(edges) ? edges[index]! : edges! }
+function appendEdge(edges: Edges, link: Link): Edges {
+  if (edges === undefined) return link
+  if (Array.isArray(edges)) { edges.push(link); return edges }
+  return [edges, link]
+}
+function removeEdge(edges: Edges, link: Link): Edges {
+  if (!Array.isArray(edges)) return undefined
+  edges.splice(edges.indexOf(link), 1)
+  return edges.length === 1 ? edges[0] : edges
+}
 const container = (value: unknown): value is object => value !== null && typeof value === 'object'
 const dirty = (link: Link) => link.different || link.dirtyChildren !== 0
 
@@ -49,7 +64,8 @@ export function incrementalCache() {
     return true
   }
   function changed(link: Link, difference: number) {
-    for (const parent of link.parents) {
+    for (let index = 0; index < edgeCount(link.parents); index++) {
+      const parent = edgeAt(link.parents, index)
       const before = dirty(parent)
       parent.dirtyChildren += difference
       if (before !== dirty(parent)) changed(parent, dirty(parent) ? 1 : -1)
@@ -79,12 +95,13 @@ export function incrementalCache() {
     metrics.drainMs += performance.now() - started
   }
   function release(link: Link) {
-    if (link.roots !== 0 || link.parents.length !== 0) return
+    if (link.roots !== 0 || link.parents !== undefined) return
     if (sourceLinks.get(link.source) === link) sourceLinks.delete(link.source)
     if (targetLinks.get(link.target) === link) targetLinks.delete(link.target)
     touched.delete(link); metrics.indexedObjects--
-    for (const child of link.children) {
-      child.parents.splice(child.parents.indexOf(link), 1)
+    for (let index = 0; index < edgeCount(link.children); index++) {
+      const child = edgeAt(link.children, index)
+      child.parents = removeEdge(child.parents, link)
       release(child)
     }
   }
@@ -107,13 +124,13 @@ export function incrementalCache() {
       const used = targets.get(target)
       if (used !== undefined && used !== source) throw new Error('Conflicting checkpoint identities')
       targets.set(target, source)
-      const link: Link = { source, target, parents: [], children: [], roots: 0, different: false, dirtyChildren: 0, differences: undefined, fields: undefined }
+      const link: Link = { source, target, parents: undefined, children: undefined, roots: 0, different: false, dirtyChildren: 0, differences: undefined, fields: undefined }
       built.set(source, link); sourceLinks.set(source, link); targetLinks.set(target, link); metrics.indexedObjects++
       function child(a: unknown, b: unknown) {
         if (!container(a)) return
         if (!container(b)) throw new Error('Invalid checkpoint correspondence')
         const entry = visit(a, b)
-        link.children.push(entry); entry.parents.push(link)
+        link.children = appendEdge(link.children, entry); entry.parents = appendEdge(entry.parents, link)
       }
       if (source instanceof Map && target instanceof Map) {
         const other = target.entries()
@@ -145,13 +162,15 @@ export function incrementalCache() {
     function activate(link: Link) { if (!active.has(link)) { active.add(link); activations.push(link) } }
     function isActive(link: Link): boolean {
       if (active.has(link)) return true
-      for (const parent of link.parents) if (active.has(parent)) return true
-      const pending = [...link.parents], seen = new Set<Link>()
+      for (let index = 0; index < edgeCount(link.parents); index++) if (active.has(edgeAt(link.parents, index))) return true
+      const pending: Link[] = [], seen = new Set<Link>()
+      for (let index = 0; index < edgeCount(link.parents); index++) pending.push(edgeAt(link.parents, index))
       for (let index = 0; index < pending.length; index++) {
         const parent = pending[index]!
         if (seen.has(parent)) continue
         seen.add(parent)
-        for (const ancestor of parent.parents) {
+        for (let position = 0; position < edgeCount(parent.parents); position++) {
+          const ancestor = edgeAt(parent.parents, position)
           if (active.has(ancestor)) return true
           pending.push(ancestor)
         }
@@ -163,7 +182,7 @@ export function incrementalCache() {
       function block(link: Link) {
         if (seen.has(link)) return
         seen.add(link); blocked.set(link, (blocked.get(link) ?? 0) + difference)
-        for (const parent of link.parents) block(parent)
+        for (let index = 0; index < edgeCount(link.parents); index++) block(edgeAt(link.parents, index))
       }
       if (a !== undefined && a.target !== target) block(a)
       if (b !== undefined && b.source !== source) block(b)
