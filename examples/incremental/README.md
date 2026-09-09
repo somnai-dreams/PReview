@@ -53,7 +53,7 @@ The example now has a button that mutates an old row alias inside a runtime-gene
 
 Reusing the existing TypeScript parser adds a roughly 4.2 MB minified preload, served without compression by this local fixture. Fetching, parsing and evaluating that preload took 191.6 ms and 122.4 ms in the two frames. Generating the small closure took 3.3 ms and 3.2 ms, including both native construction and instrumentation. The diagnostic panel reports cumulative generated-code compilation time and total browser heap when available. Total heap includes the application, checkpoints, retained indexes and transient allocations; it does not isolate parser overhead. A controlled retained-heap measurement is still missing. The parser is retained, but individual generated source strings and ASTs are not kept in a cache.
 
-Launchers place a `preview-preload-start` performance mark immediately before loading the preload. This makes the displayed preload duration include its fetch, parse and evaluation rather than only timing the module body after parsing.
+These measurements used an external performance mark before loading the preload. The current diagnostic reports `initializationMs` for observer setup within the module body; it excludes fetch and parse time and needs no launcher-supplied mark.
 
 ## Changed-subgraph reproduction (9 September 2026)
 

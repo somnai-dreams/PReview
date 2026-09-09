@@ -209,7 +209,8 @@ async function swap(index) {
     active = index;
     frames[active].classList.add('active');
     buttons[active].setAttribute('aria-pressed', 'true');
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    // React already committed. Finishing must not depend on paint callbacks,
+    // which browsers suspend when the reviewer is in a background tab.
     record.timing.presentationMs = performance.now() - presenting;
     record.outcome = 'restored';
   } catch (error) {
