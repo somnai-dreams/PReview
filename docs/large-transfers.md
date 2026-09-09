@@ -1,6 +1,6 @@
 # Large initial transfers: measured costs and next design
 
-This is an investigation of the runtime at `95c8eea`, not a shipped optimization or a claim that large transfers are fixed. Preserve all supported state and aliases. Do not infer that a large collection is expendable, weaken destination validation, or require changes to application feature files.
+The baseline investigation below covers the runtime at `95c8eea`. The implementation and measurements at the end describe the subsequent correspondence consolidation; they do not establish that large real application transfers are fixed. Preserve all supported state and aliases. Do not infer that a large collection is expendable, weaken destination validation, or require changes to application feature files.
 
 ## What was measured
 
@@ -51,3 +51,15 @@ Before replacing the current runtime:
 - Verify the failing application workflow itself before claiming the issue fixed. Synthetic results establish a mechanism and candidate direction, not application success.
 
 If this consolidation still leaves unacceptable retained memory, the next architecture to prototype is a versioned object journal with temporary wire snapshots. It could remove the permanent duplicate snapshot, but first needs a proof for concurrent writes, destination drift, repair, and multi-build baselines. That larger protocol change is not justified as the first implementation step by the measurements above.
+
+## Implemented consolidation
+
+Capture now constructs owned snapshots when validation completes each object and records their live correspondence immediately. It attaches schema proofs to those exact copies. The wire encoder reuses owned data where no reference marker is needed; source capture no longer decodes and revalidates its own output.
+
+Reconciliation records canonical objects directly in the same index before React effects run. Unfinished nodes remain invalid. Construction retains only unattached roots, connects children before releasing prior ownership, and releases rejected or superseded graphs when the transfer ends. Restoration uses these correspondences for copy identity and destination claims instead of retaining complete additional maps. Full comparisons remain the fallback when write coverage is incomplete.
+
+Repair validates replacement refs through already checked, unchanged subgraphs. Generic plain-data validation chooses the actual container kind directly instead of trying a multi-branch union at every node. Prototype, descriptor, finite-number, resource, primitive Map-key and cycle checks remain enforced.
+
+The same clean-browser 100,000-row workload measured an initial transfer of **4,507 ms**, an unchanged return of **2.1 ms**, a nested edit of **556 ms**, and another return of **1.4 ms**. Collected heap after the initial transfer was **580 MB**; the largest phase sample was **809 MB**. Against the recorded baseline, these observations reduce initial latency by about 51% and the sampled heap maximum by about 34%. Retained heap falls only about 5%, so permanent graph storage remains a limitation. These are individual profiled synthetic runs, with the same limitations described above.
+
+Both frames passed a complete check of every row, tag, metadata value and detail record after the sequence; selection identity stayed shared. A 200-step addition/removal/reordering/alias sequence also passed and released obsolete index entries. Regression checks exercise first-commit effect writes through old aliases, incomplete coverage, rejected capture roots, collection ordering, remount repair and incompatible schemas. Hosted application success still requires the fully loaded real workflow.

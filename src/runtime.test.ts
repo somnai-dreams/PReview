@@ -407,3 +407,43 @@ test('rejected deltas remain decodable on retry without becoming validated appli
   expect(corrected.rejected).toEqual([])
   expect(destination.cell.read()).toEqual({ count: 2 })
 })
+
+test('cold restore observes writes through old aliases before its first commit and keeps full fallback', () => {
+  for (const observed of [true, false]) {
+    const cache = incrementalCache(); cache.coverage(observed)
+    const row = { count: 0 }, feed = cell('feed', 'ref', [row]), selected = cell('selected', 'state', null)
+    const { runtime } = harness(() => { if (observed) cache.touch(row, 'property', 'count'); row.count++ }, false, cache)
+    runtime.register(feed.cell); runtime.register(selected.cell)
+    const saved = { count: 10 }
+    const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
+      { id: 'feed', kind: 'ref', value: [saved] }, { id: 'selected', kind: 'state', value: saved },
+    ] })
+    expect(report.secondPass).toEqual(['feed', 'selected'])
+    expect(report.changed).toEqual(['feed', 'selected'])
+    expect(row.count).toBe(11)
+    expect((feed.cell.read() as Value[])[0]).toBe(row)
+    expect(selected.cell.read()).toBe(row)
+    cache.clear(); expect(cache.stats().indexedObjects).toBe(0)
+  }
+})
+
+test('owned wire snapshots preserve ordered collections and aliases when a new root joins retained data', () => {
+  for (const indexed of [true, false]) {
+    const aCache = incrementalCache(), bCache = incrementalCache()
+    aCache.coverage(indexed); bCache.coverage(indexed)
+    const a = harness(undefined, true, aCache).runtime, b = harness(undefined, true, bCache).runtime
+    const one = { count: 1 }, two = { count: 2 }, aFeed = cell('feed', 'ref', new Map([['one', one], ['two', two]])), bFeed = cell('feed', 'ref', new Map())
+    a.register(aFeed.cell); b.register(bFeed.cell)
+    expect(b.restore(structuredClone(a.capture())).rejected).toEqual([])
+    const aExtra = cell('extra', 'ref', { order: new Map([['two', two], ['one', one]]), selection: new Set([two, one]) }), bExtra = cell('extra', 'ref', null)
+    a.register(aExtra.cell); b.register(bExtra.cell)
+    const packet = a.capture()
+    expect(packet.references).toHaveLength(2)
+    expect(b.restore(structuredClone(packet)).changed).toEqual([])
+    const feed = bFeed.cell.read() as Map<string, Value>, extra = bExtra.cell.read() as { order: Map<string, Value>; selection: Set<Value> }
+    expect([...extra.order.keys()]).toEqual(['two', 'one'])
+    expect([...extra.selection]).toEqual([{ count: 2 }, { count: 1 }])
+    expect(extra.order.get('two')).toBe(feed.get('two'))
+    expect([...extra.selection][0]).toBe(feed.get('two'))
+  }
+})

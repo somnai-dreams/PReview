@@ -129,19 +129,21 @@ function capture() {
   const captureReuse = incremental?.phase()
   const { retained, reverse } = checkpoint === null ? { retained: new Set(), reverse: new Map() } : retainedCells(previous, candidates, captureReuse)
   const comparisonMs = performance.now() - started
+  const construction = incremental?.begin()
+  const captureCopy = validation.capturePhase(reverse, construction)
+  try {
   const priorValues = new Map(previous.map(saved => [saved.id, saved]))
   const owners = new Map()
   for (const [id, instances] of cells) {
     if (instances.length !== 1) { skipped.push({ id, reason: 'multiple instances', count: instances.length }); continue }
     const cell = instances[0]
     const value = cell.read()
-    const matched = reverse.get(value)
-    if (!retained.has(id) && !(matched === undefined ? validation.acceptsLive(cell.schema, value, reverse) : validation.accepts(cell.schema, matched))) {
+    if (!retained.has(id) && !captureCopy.accepts(cell.schema, value)) {
       const root = cell.schema.nodes[cell.schema.root]
       skipped.push({ id, reason: root.kind === 'reject' ? root.reason : 'unsupported value or type' })
       continue
     }
-    values.push({ id, kind: cell.kind, value })
+    values.push({ id, kind: cell.kind, value: retained.has(id) ? priorValues.get(id).value : captureCopy.value(value) })
     owners.set(id, cell)
   }
   const scroll = []
@@ -165,26 +167,25 @@ function capture() {
   const changedValues = values.filter(saved => !retained.has(saved.id))
   const baseObjects = checkpoint?.snapshot.values.map(saved => saved.value) ?? []
   const encodingAt = performance.now()
-  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, reverse, captureReuse?.baseTarget)
+  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, { get: source => captureCopy.reused(source) ? source : undefined }, construction?.previous, true)
   const encodedAt = performance.now()
-  const decoded = decodeValues(encoded.values, encoded.references, baseObjects)
   const snapshot = structuredClone({ skipped, scroll, history: navigation, session })
-  snapshot.values = changedValues.map((saved, index) => ({ ...saved, value: decoded[index] }))
+  snapshot.values = changedValues
   const changed = new Map(snapshot.values.map(saved => [saved.id, saved]))
   const encodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: encoded.values[index] }]))
   const entries = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, reuse: true } : encodedById.get(saved.id))
   snapshot.values = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, value: priorValues.get(saved.id).value } : changed.get(saved.id))
-  for (const saved of snapshot.values) validation.remember(owners.get(saved.id).schema, saved.value)
   const indexingAt = performance.now()
-  incremental?.keep(snapshot.values.map(saved => ({ source: saved.value, target: owners.get(saved.id).read() })))
+  construction?.commit(snapshot.values.map(saved => ({ source: saved.value, target: owners.get(saved.id).read() })))
   snapshot.captureMs = performance.now() - started
   snapshot.comparisonMs = comparisonMs
-  snapshot.captureDetails = { validationAndScrollMs: encodingAt - started - comparisonMs, encodeMs: encodedAt - encodingAt, decodeAndValidateMs: indexingAt - encodedAt, captureIndexMs: performance.now() - indexingAt, heapBytes: performance.memory?.usedJSHeapSize, copiedObjects: encoded.copiedObjects, patchedObjects: encoded.patchedObjects, reusedObjects: encoded.reusedObjects }
+  snapshot.captureDetails = { validationAndScrollMs: encodingAt - started - comparisonMs, encodeMs: encodedAt - encodingAt, decodeAndValidateMs: indexingAt - encodedAt, captureIndexMs: performance.now() - indexingAt, heapBytes: performance.memory?.usedJSHeapSize, copiedObjects: captureCopy.count(), patchedObjects: encoded.patchedObjects, reusedObjects: encoded.reusedObjects }
   snapshot.incremental = incremental?.stats()
   const base = checkpoint?.id ?? null, id = crypto.randomUUID()
   checkpoint = { id, snapshot, owners }
   rejectedCheckpoint = null
   return { ...snapshot, values: entries, references: encoded.references, base, id }
+  } finally { construction?.close() }
 }
 
 function restore(packet) {
@@ -237,7 +238,9 @@ function restore(packet) {
   }
   // Ambiguous owners stay local for this entire transfer, including remounts.
   const transferable = snapshot.values.filter(saved => !skipped.some(item => item.id === saved.id))
-  pending = { values: transferable, context: restoration(matches, { has: value => reverse.get(value) !== undefined }, reuse) }
+  const construction = incremental?.begin()
+  for (const saved of transferable) if (retained.has(saved.id)) construction?.adopt(saved.value, cells.get(saved.id)[0].read())
+  pending = { values: transferable, context: restoration(matches, { has: value => reverse.get(value) !== undefined }, reuse, construction) }
   function applyValues(entries) {
     // Validation precedes this synchronous commit. Refs establish canonical
     // container identities before state that may point into the same graph.
@@ -256,7 +259,8 @@ function restore(packet) {
   nativeReplace(target.state, '', target.path)
   // Mount/reset effects can introduce owners or change restored values. Repair
   // only those cells, preserving the graph identities established above.
-  const repairs = [], settled = [], repairComparison = comparison(pending.context.copies, incremental?.phase())
+  const repairReuse = incremental?.phase()
+  const repairs = [], settled = [], repairComparison = comparison(pending.context.copies, repairReuse)
   for (const saved of transferable) {
     const instances = cells.get(saved.id)
     if (instances === undefined) continue
@@ -272,7 +276,7 @@ function restore(packet) {
       if (!restored.includes(saved.id)) restored.push(saved.id)
       continue
     }
-    if (saved.kind === 'ref' && !accepts(cell.schema, cell.read())) { rejections.push({ id: saved.id, reason: 'live-ref-invalid', phase: 'repair' }); continue }
+    if (saved.kind === 'ref' && !validation.acceptsLive(cell.schema, cell.read(), { get: value => repairComparison.reverse.get(value) ?? repairReuse?.reuseTarget(value) })) { rejections.push({ id: saved.id, reason: 'live-ref-invalid', phase: 'repair' }); continue }
     repairs.push({ saved, cell })
   }
   const secondPass = repairs.map(entry => entry.saved.id)
@@ -282,7 +286,8 @@ function restore(packet) {
   if (repaired) {
     // These roots were just checked. Keep their proofs across the repair commit
     // so observed effect writes invalidate only the graphs they actually touch.
-    incremental?.keep(settled)
+    if (construction === undefined) incremental?.keep(settled)
+    else for (const pair of settled) construction.adopt(pair.source, pair.target)
     repairIndexedAt = performance.now()
     pending.context.pass++
     // Repair can alias a large, already settled ref. Reuse its verified objects
@@ -326,10 +331,14 @@ function restore(packet) {
     checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
     rejectedCheckpoint = null
   } else rejectedCheckpoint = { id: packet.id, snapshot, owners: new Map() }
-  if (rejections.length === 0) incremental?.keep(snapshot.values.flatMap(saved => { const instances = cells.get(saved.id); return instances?.length === 1 && restored.includes(saved.id) && !changed.includes(saved.id) ? [{source:saved.value,target:instances[0].read()}] : [] }))
+  if (rejections.length === 0) {
+    const pairs = snapshot.values.flatMap(saved => { const instances = cells.get(saved.id); return instances?.length === 1 && restored.includes(saved.id) && !changed.includes(saved.id) ? [{source:saved.value,target:instances[0].read()}] : [] })
+    if (construction === undefined) incremental?.keep(pairs)
+    else construction.commit(pairs)
+  }
   return { incremental: incremental?.stats(), restored, rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
     timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, repairCheckMs: repairCheckedAt - firstCommit, repairIndexMs: repairIndexedAt - repairCheckedAt, repairCommitMs: secondCommit - repairIndexedAt, verificationMs: performance.now() - secondCommit, restoreMs: performance.now() - started } }
-  } finally { pending = null }
+  } finally { pending = null; construction?.close() }
 }
 
 globalThis.__preview = { capture, restore }

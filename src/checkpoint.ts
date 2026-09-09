@@ -23,7 +23,8 @@ type Reference = { marker: object; cell: number; path: Step[]; patch?: Patch }
 
 // The marker side table uses object identity, so application data cannot collide
 // with a magic property name. postMessage preserves these identities in its clone.
-export function encodeValues(values: Value[], base: Value[], reusable: Pick<PairMap, 'get'>, previous?: (source: object) => object | undefined) {
+export function encodeValues(values: Value[], base: Value[], reusable: Pick<PairMap, 'get'>, previous?: (source: object) => object | undefined, owned = false) {
+  if (owned && base.length === 0) return { values, references: [], copiedObjects: 0, patchedObjects: 0, reusedObjects: 0 }
   const references: Reference[] = []
   const copies = new Map<object, Value>(), wanted = new Map<object, Reference[]>()
   let copiedObjects = 0, patchedObjects = 0
@@ -65,6 +66,27 @@ export function encodeValues(values: Value[], base: Value[], reusable: Pick<Pair
       const marker = reference(source, prior, patch); patchedObjects++
       for (const key of Object.keys(source)) if (!Object.hasOwn(prior, key) || !same(Reflect.get(source, key), Reflect.get(prior, key))) patch.entries.push([key, encode(Reflect.get(source, key))])
       return marker
+    }
+    if (owned) {
+      // Keep the validated snapshot itself wherever the wire needs no marker.
+      // Only paths to references need a different wire representation.
+      let target = source
+      copies.set(source, target)
+      if (Array.isArray(source)) {
+        for (let i = 0; i < source.length; i++) { const value = encode(source[i]); if (value !== source[i]) { if (target === source) target = source.slice(); (target as Value[])[i] = value } }
+      } else if (source instanceof Map) {
+        for (const [key, item] of source) if (encode(key) !== key || encode(item) !== item) {
+          const map = new Map<Value, Value>()
+          for (const [key, item] of source) map.set(encode(key), encode(item))
+          target = map; break
+        }
+      } else if (source instanceof Set) {
+        for (const item of source) if (encode(item) !== item) { target = new Set([...source].map(encode)); break }
+      } else {
+        for (const key of Object.keys(source)) { const value = encode(source[key]); if (value !== source[key]) { if (target === source) target = { ...source }; Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true }) } }
+      }
+      copies.set(source, target)
+      return target
     }
     copiedObjects++
     let target: Value

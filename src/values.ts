@@ -11,6 +11,16 @@ export type ComparisonAcceleration = {
   added: (source: object, target: object) => void
   removed: (source: object, target: object) => void
 }
+export type Construction = {
+  start: (source: object, target: object, pass: number) => void
+  finish: (source: object) => void
+  adopt: (source: unknown, target: unknown) => void
+  get: (source: object) => { value: object; pass: number } | undefined
+  source: (target: object) => object | undefined
+  previous: (source: object) => object | undefined
+  commit: (values: { source: unknown; target: unknown }[]) => void
+  close: () => void
+}
 type Copies = { get: (source: object) => { value: Container; pass: number } | undefined; set: (source: object, copy: { value: Container; pass: number }) => void; changed: Map<object, { value: Container; pass: number }> }
 
 export type Shape =
@@ -30,18 +40,43 @@ export type Value = null | undefined | string | number | boolean | Container
 
 // `unknown` has no narrower static contract. It still must pass the supported
 // data boundary; functions, accessors, DOM nodes and class instances fail it.
-const dataSchema: Schema = { root: 0, nodes: [
-  { kind: 'union', members: [1, 2, 3, 4, 5, 6, 7, 8, 9] },
-  { kind: 'literal', value: null },
-  { kind: 'primitive', name: 'undefined' },
-  { kind: 'primitive', name: 'string' },
-  { kind: 'primitive', name: 'number' },
-  { kind: 'primitive', name: 'boolean' },
-  { kind: 'array', item: 0 }, { kind: 'set', item: 0 },
-  { kind: 'map', key: 10, value: 0 },
-  { kind: 'object', fields: [], index: 0 },
-  { kind: 'union', members: [1, 2, 3, 4, 5] },
-] }
+const dataSchema: Schema = { root: 0, nodes: [{ kind: 'data' }] }
+
+function acceptsData(value: unknown, depth: number, validation?: Validation): boolean {
+  if (value === null) return true
+  switch (typeof value) {
+    case 'undefined': case 'string': case 'boolean': return true
+    case 'number': return Number.isFinite(value)
+    case 'object': break
+    default: return false
+  }
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length !== 0 || Object.getOwnPropertyNames(value).length !== value.length + 1) return false
+    for (let i = 0; i < value.length; i++) {
+      const field = Object.getOwnPropertyDescriptor(value, i)
+      if (field === undefined || !('value' in field) || !field.enumerable || !accepts(dataSchema, field.value, 0, depth + 1, validation)) return false
+    }
+    return true
+  }
+  if (value instanceof Map) {
+    if (Object.getPrototypeOf(value) !== Map.prototype || Reflect.ownKeys(value).length !== 0) return false
+    for (const [key, item] of value) {
+      if (key !== null && typeof key === 'object' || !accepts(dataSchema, key, 0, depth + 1, validation) || !accepts(dataSchema, item, 0, depth + 1, validation)) return false
+    }
+    return true
+  }
+  if (value instanceof Set) {
+    if (Object.getPrototypeOf(value) !== Set.prototype || Reflect.ownKeys(value).length !== 0) return false
+    for (const item of value) if (!accepts(dataSchema, item, 0, depth + 1, validation)) return false
+    return true
+  }
+  if (!plain(value) || Object.getOwnPropertySymbols(value).length !== 0) return false
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const field = Object.getOwnPropertyDescriptor(value, key)!
+    if (!('value' in field) || !field.enumerable || !accepts(dataSchema, field.value, 0, depth + 1, validation)) return false
+  }
+  return true
+}
 
 function plain(value: object): value is Record<string, unknown> {
   return Object.getPrototypeOf(value) === Object.prototype
@@ -59,7 +94,7 @@ function acceptsShape(schema: Schema, value: unknown, id: number, depth: number,
   const shape = schema.nodes[id]
   if (shape === undefined) throw new Error('Invalid generated schema reference')
   switch (shape.kind) {
-    case 'data': return accepts(dataSchema, value, 0, depth + 1, validation)
+    case 'data': return acceptsData(value, depth, validation)
     case 'reject': return false
     case 'primitive': return typeof value === shape.name && (typeof value !== 'number' || Number.isFinite(value))
     case 'literal': return value === shape.value
@@ -238,23 +273,69 @@ export function checkpointValidation() {
   function remember(schema: Schema, value: Value) {
     if (!acceptsCopy(schema, value)) throw new Error('Captured checkpoint failed validation')
   }
-  return { accepts: acceptsCopy, acceptsLive, remember }
+
+  // Validation completes children before their parent. Construct that exact
+  // owned copy here and attach the successful schema proof to it once.
+  function capturePhase(previous: Pick<PairMap, 'get'>, construction?: Construction) {
+    const fallback = construction === undefined ? new Map<object, object>() : undefined
+    let count = 0
+    const reused = new WeakSet<object>()
+    function copied(value: object) {
+      const current = construction?.source(value) ?? fallback?.get(value)
+      if (current !== undefined) return current
+      const prior = previous.get(value)
+      if (prior !== undefined) reused.add(prior)
+      return prior
+    }
+    function copyOf(value: unknown): Value {
+      if (value === null || typeof value !== 'object') return value as Value
+      const copy = copied(value)
+      if (copy === undefined) throw new Error('Missing validated child')
+      construction?.adopt(copy, value)
+      return copy as Value
+    }
+    const phase: Validation = {
+      known(schema, value, id) {
+        const copy = copied(value)
+        return copy !== undefined && accepts(schema, copy, id, 0, owned)
+      },
+      remember(schema, value, id) {
+        let copy = copied(value)
+        if (copy === undefined) {
+          if (Array.isArray(value)) copy = value.map(copyOf)
+          else if (value instanceof Map) { const map = new Map<Value, Value>(); for (const [key, item] of value) map.set(copyOf(key), copyOf(item)); copy = map }
+          else if (value instanceof Set) { const set = new Set<Value>(); for (const item of value) set.add(copyOf(item)); copy = set }
+          else { const object: Record<string, Value> = {}; for (const key of Object.keys(value)) Object.defineProperty(object, key, { value: copyOf(Reflect.get(value, key)), enumerable: true, configurable: true, writable: true }); copy = object }
+          if (construction === undefined) fallback!.set(value, copy)
+          else { construction.start(copy, value, 0); construction.finish(copy) }
+          count++
+        }
+        owned.remember(schema, copy, id)
+      },
+    }
+    return { accepts: (schema: Schema, value: unknown) => accepts(schema, value, schema.root, 0, phase), value: copyOf, reused: (value: object) => reused.has(value), count: () => count }
+  }
+  return { accepts: acceptsCopy, acceptsLive, remember, capturePhase }
 }
 
-export type Restoration = { copies: Copies; claimed: { has: (value: object) => boolean; add: (value: object) => void }; pass: number; settled: Pick<PairMap, 'get'> | undefined }
-export function restoration(matches: Pick<PairMap, 'get'> = new Map(), reverse: Pick<PairMap, 'has'> = new Map(), acceleration?: ComparisonAcceleration): Restoration {
+export type Restoration = { copies: Copies; claimed: { has: (value: object) => boolean; add: (value: object) => void }; pass: number; settled: Pick<PairMap, 'get'> | undefined; construction: Construction | undefined }
+export function restoration(matches: Pick<PairMap, 'get'> = new Map(), reverse: Pick<PairMap, 'has'> = new Map(), acceleration?: ComparisonAcceleration, construction?: Construction): Restoration {
   const changed: Copies['changed'] = new Map(), claimed = new Set<object>()
   const copies: Copies = {
     changed,
     get(source) {
-      const copy = changed.get(source)
-      if (copy !== undefined) return copy
+      const copy = construction?.get(source) ?? changed.get(source)
+      if (copy !== undefined) return copy as { value: Container; pass: number }
       const value = matches.get(source) ?? acceleration?.reuseSource(source)
-      return value === undefined ? undefined : { value: value as Container, pass: 0 }
+      if (value === undefined) return undefined
+      return { value: value as Container, pass: 0 }
     },
-    set(source, copy) { changed.set(source, copy); acceleration?.added(source, copy.value) },
+    set(source, copy) {
+      if (construction === undefined) { changed.set(source, copy); acceleration?.added(source, copy.value) }
+      else construction.start(source, copy.value, copy.pass)
+    },
   }
-  return { copies, claimed: { has: value => claimed.has(value) || reverse.has(value), add: value => { claimed.add(value) } }, pass: 0, settled: undefined }
+  return { copies, claimed: { has: value => claimed.has(value) || construction?.source(value) !== undefined || reverse.has(value) || acceleration?.reverse(value) !== undefined, add: value => { if (construction === undefined) claimed.add(value) } }, pass: 0, settled: undefined, construction }
 }
 
 export function matchesRestoration(source: Value, current: unknown, context: Restoration): boolean {
@@ -297,5 +378,6 @@ export function reconcile(source: Value, destination: unknown, context: Restorat
       Object.defineProperty(target, key, { value, enumerable: true, configurable: true, writable: true })
     }
   } else throw new Error('Checkpoint container mismatch')
+  context.construction?.finish(source)
   return target
 }

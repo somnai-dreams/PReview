@@ -1,6 +1,6 @@
-import type { ComparisonAcceleration } from './values'
+import type { ComparisonAcceleration, Construction } from './values'
 
-type Link = { source: object; target: object; parents: Edges; children: Edges; roots: number; different: boolean; dirtyChildren: number; differences: Set<PropertyKey> | undefined; fields: Set<PropertyKey> | null | undefined }
+type Link = { generation: number; pass: number; source: object; target: object; parents: Edges; children: Edges; roots: number; different: boolean; dirtyChildren: number; differences: Set<PropertyKey> | undefined; fields: Set<PropertyKey> | null | undefined }
 // Most data objects have one parent and zero or one child. Keep those edges
 // directly; allocate a list only for actual branching or shared ownership.
 type Edges = Link | Link[] | undefined
@@ -24,7 +24,7 @@ const dirty = (link: Link) => link.different || link.dirtyChildren !== 0
 export function incrementalCache() {
   const sourceLinks = new WeakMap<object, Link>(), targetLinks = new WeakMap<object, Link>()
   const touched = new Set<Link>()
-  let roots: Link[] = [], enabled = true, coverage = true
+  let roots: Link[] = [], enabled = true, coverage = true, generation = 0
   const metrics = { indexedObjects: 0, indexedRoots: 0, fieldChecks: 0, shallowChecks: 0, hits: 0, misses: 0, drainMs: 0, indexMs: 0 }
   function touch<T>(value: T, operation = 'property', field?: PropertyKey): T {
     if (!container(value)) return value
@@ -75,6 +75,9 @@ export function incrementalCache() {
     if (touched.size === 0) return
     const started = performance.now()
     for (const link of touched) {
+      // Replaced correspondences stay invalid until their old roots release
+      // them. A pending same-value write cannot revive obsolete alias ownership.
+      if (sourceLinks.get(link.source) !== link || targetLinks.get(link.target) !== link) continue
       let different: boolean
       if (link.fields === null) {
         different = !shallow(link)
@@ -109,55 +112,113 @@ export function incrementalCache() {
     for (const root of roots) { root.roots--; release(root) }
     roots = []
   }
-  function keep(values: { source: unknown; target: unknown }[]) {
+  // Construction owns only the unattached roots of new correspondences. Children
+  // move under their parents as they are completed; there is no second full map.
+  function begin(): Construction | undefined {
     drain()
-    if (!enabled || !coverage) { clear(); return }
-    const started = performance.now(), next: Link[] = [], built = new Map<object, Link>(), targets = new Map<object, object>()
-    function visit(source: object, target: object): Link {
-      const existing = built.get(source)
-      if (existing !== undefined) {
-        if (existing.target !== target) throw new Error('Conflicting checkpoint aliases')
-        return existing
+    if (!enabled || !coverage) return undefined
+    const id = ++generation, staged = new Set<Link>(), previous = new WeakMap<object, object>()
+    let closed = false
+    function pin(link: Link) { if (!staged.has(link)) { staged.add(link); link.roots++ } }
+    function unpin(link: Link) { if (staged.delete(link)) link.roots-- }
+    function invalidate(link: Link) {
+      const before = dirty(link)
+      link.different = true
+      if (!before) changed(link, 1)
+    }
+    function start(source: object, target: object, pass: number) {
+      if (closed) throw new Error('Checkpoint construction is closed')
+      const prior = sourceLinks.get(source), owner = targetLinks.get(target)
+      if (prior?.generation === id) {
+        if (prior.target !== target) throw new Error('Conflicting checkpoint aliases')
+        prior.pass = pass; invalidate(prior); return
       }
-      const previous = sourceLinks.get(source)
-      if (previous !== undefined && previous.target === target && !dirty(previous)) return previous
-      const used = targets.get(target)
-      if (used !== undefined && used !== source) throw new Error('Conflicting checkpoint identities')
-      targets.set(target, source)
-      const link: Link = { source, target, parents: undefined, children: undefined, roots: 0, different: false, dirtyChildren: 0, differences: undefined, fields: undefined }
-      built.set(source, link); sourceLinks.set(source, link); targetLinks.set(target, link); metrics.indexedObjects++
+      if (owner?.generation === id && owner.source !== source) throw new Error('Conflicting checkpoint identities')
+      if (prior !== undefined) invalidate(prior)
+      if (owner !== undefined) { previous.set(source, owner.source); invalidate(owner) }
+      const link: Link = { generation: id, pass, source, target, parents: undefined, children: undefined, roots: 0, different: true, dirtyChildren: 0, differences: undefined, fields: undefined }
+      sourceLinks.set(source, link); targetLinks.set(target, link)
+      pin(link); metrics.indexedObjects++
+    }
+    function finish(source: object) {
+      const link = sourceLinks.get(source)
+      if (link?.generation !== id) throw new Error('Missing checkpoint construction')
+      const oldChildren = link.children, wasDirty = dirty(link)
+      link.children = undefined; link.dirtyChildren = 0
       function child(a: unknown, b: unknown) {
         if (!container(a)) return
-        if (!container(b)) throw new Error('Invalid checkpoint correspondence')
-        const entry = visit(a, b)
-        link.children = appendEdge(link.children, entry); entry.parents = appendEdge(entry.parents, link)
+        const entry = sourceLinks.get(a)
+        if (entry === undefined || entry.target !== b) throw new Error('Missing checkpoint child correspondence')
+        link!.children = appendEdge(link!.children, entry); entry.parents = appendEdge(entry.parents, link!)
+        if (dirty(entry)) link!.dirtyChildren++
+        unpin(entry)
       }
+      const a = source, b = link.target
+      if (a instanceof Map && b instanceof Map) {
+        const other = b.entries()
+        for (const [key, value] of a) { const row = other.next().value!; child(key, row[0]); child(value, row[1]) }
+      } else if (a instanceof Set && b instanceof Set) {
+        const other = b.values()
+        for (const value of a) child(value, other.next().value)
+      } else for (const key of Object.keys(a)) child(Reflect.get(a, key), Reflect.get(b, key))
+      // Acquire children first. Detached copies stay canonical until this
+      // transfer ends, including when effects replace an outer ref during repair.
+      for (let index = 0; index < edgeCount(oldChildren); index++) {
+        const child = edgeAt(oldChildren, index)
+        child.parents = removeEdge(child.parents, link)
+        if (child.parents === undefined && child.roots === 0) pin(child)
+      }
+      touched.delete(link); link.fields = undefined; link.differences = undefined; link.different = false
+      if (wasDirty !== dirty(link)) changed(link, dirty(link) ? 1 : -1)
+    }
+    // Used only for a correspondence already established by a full comparison.
+    // Controlled copying/reconciliation calls start/finish itself, bottom-up.
+    function adopt(source: unknown, target: unknown): Link | undefined {
+      if (!container(source) || !container(target)) return undefined
+      const prior = sourceLinks.get(source)
+      if (prior !== undefined && prior.target === target && !dirty(prior)) return prior
+      start(source, target, 0)
       if (source instanceof Map && target instanceof Map) {
         const other = target.entries()
-        for (const [key, value] of source) { const row = other.next().value!; child(key, row[0]); child(value, row[1]) }
+        for (const [key, value] of source) { const row = other.next().value!; adopt(key, row[0]); adopt(value, row[1]) }
       } else if (source instanceof Set && target instanceof Set) {
         const other = target.values()
-        for (const value of source) child(value, other.next().value)
-      } else {
-        for (const key of Object.keys(source)) child(Reflect.get(source, key), Reflect.get(target, key))
-      }
-      return link
+        for (const value of source) adopt(value, other.next().value)
+      } else for (const key of Object.keys(source)) adopt(Reflect.get(source, key), Reflect.get(target, key))
+      finish(source)
+      return sourceLinks.get(source)!
     }
-    // Acquire new roots before releasing old roots: most descendants are shared
-    // with the previous checkpoint, so their watches survive without rebuilding.
-    for (const { source, target } of values) {
-      if (!container(source) || !container(target)) continue
-      const root = visit(source, target)
-      root.roots++; next.push(root)
-      if (built.has(source)) metrics.indexedRoots++
+    function close() {
+      if (closed) return
+      closed = true
+      for (const link of staged) { link.roots--; release(link) }
+      staged.clear()
     }
-    for (const root of roots) { root.roots--; release(root) }
-    roots = next
+    return {
+      start, finish, adopt, close,
+      get(source) { const link = sourceLinks.get(source); return link?.generation === id ? { value: link.target, pass: link.pass } : undefined },
+      source(target) { const link = targetLinks.get(target); return link?.generation === id ? link.source : undefined },
+      previous: source => previous.get(source),
+      commit(values) {
+        drain()
+        const next: Link[] = []
+        for (const { source, target } of values) { const root = adopt(source, target); if (root !== undefined) { root.roots++; next.push(root); if (root.generation === id) metrics.indexedRoots++ } }
+        for (const root of roots) { root.roots--; release(root) }
+        roots = next
+        close()
+        if (!enabled || !coverage) clear()
+      },
+    }
+  }
+  function keep(values: { source: unknown; target: unknown }[]) {
+    const started = performance.now(), construction = begin()
+    if (construction === undefined) { clear(); return }
+    try { construction.commit(values) } finally { construction.close() }
     metrics.indexMs += performance.now() - started
   }
   function phase(): ComparisonAcceleration | undefined {
     drain()
-    if (!enabled || !coverage || roots.length === 0) return undefined
+    if (!enabled || !coverage || metrics.indexedObjects === 0) return undefined
     const active = new Set<Link>(), activations: Link[] = [], blocked = new Map<Link, number>()
     function activate(link: Link) { if (!active.has(link)) { active.add(link); activations.push(link) } }
     function isActive(link: Link): boolean {
@@ -188,7 +249,7 @@ export function incrementalCache() {
       if (b !== undefined && b.source !== source) block(b)
     }
     function reusable(link: Link | undefined) {
-      if (link === undefined || dirty(link) || (blocked.get(link) ?? 0) !== 0) return false
+      if (link === undefined || sourceLinks.get(link.source) !== link || targetLinks.get(link.target) !== link || dirty(link) || (blocked.get(link) ?? 0) !== 0) return false
       activate(link); metrics.hits++; return true
     }
     return {
@@ -209,7 +270,7 @@ export function incrementalCache() {
       removed(source, target) { conflicts(source, target, -1) },
     }
   }
-  return { touch, keep, phase, clear,
+  return { touch, begin, keep, phase, clear,
     configure(mode: 'full' | 'incremental') { enabled = mode === 'incremental'; if (!enabled) clear() },
     coverage(complete: boolean) { coverage = complete; if (!complete) clear() },
     stats: () => ({ ...metrics, enabled: enabled && coverage, coverage, roots: roots.length, pending: touched.size }),
