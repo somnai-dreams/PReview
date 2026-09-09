@@ -1,5 +1,10 @@
 export type PairMap = { get: (key: object) => object | undefined; has: (key: object) => boolean; set: (key: object, value: object) => void; delete: (key: object) => void }
 export type ComparisonAcceleration = {
+  baseTarget: (target: object) => object | undefined
+  mark: () => number
+  rollback: (mark: number) => void
+  reuseSource: (source: object) => object | undefined
+  reuseTarget: (target: object) => object | undefined
   match: (source: unknown, target: unknown) => boolean
   get: (source: object) => object | undefined
   reverse: (target: object) => object | undefined
@@ -42,16 +47,23 @@ function plain(value: object): value is Record<string, unknown> {
   return Object.getPrototypeOf(value) === Object.prototype
 }
 
-export function accepts(schema: Schema, value: unknown, id = schema.root, depth = 0): value is Value {
+type Validation = { known: (schema: Schema, value: object, id: number) => boolean; remember: (schema: Schema, value: object, id: number) => void }
+export function accepts(schema: Schema, value: unknown, id = schema.root, depth = 0, validation?: Validation): value is Value {
   if (depth > 100) return false
+  if (value !== null && typeof value === 'object' && validation?.known(schema, value, id)) return true
+  const valid = acceptsShape(schema, value, id, depth, validation)
+  if (valid && value !== null && typeof value === 'object') validation?.remember(schema, value, id)
+  return valid
+}
+function acceptsShape(schema: Schema, value: unknown, id: number, depth: number, validation?: Validation): value is Value {
   const shape = schema.nodes[id]
   if (shape === undefined) throw new Error('Invalid generated schema reference')
   switch (shape.kind) {
-    case 'data': return accepts(dataSchema, value, 0, depth + 1)
+    case 'data': return accepts(dataSchema, value, 0, depth + 1, validation)
     case 'reject': return false
     case 'primitive': return typeof value === shape.name && (typeof value !== 'number' || Number.isFinite(value))
     case 'literal': return value === shape.value
-    case 'union': return shape.members.some(member => accepts(schema, value, member, depth + 1))
+    case 'union': return shape.members.some(member => accepts(schema, value, member, depth + 1, validation))
     case 'array':
     case 'tuple':
       if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0
@@ -60,16 +72,16 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
       for (let index = 0; index < value.length; index++) {
         const field = Object.getOwnPropertyDescriptor(value, index)
         if (field === undefined || !('value' in field) || !field.enumerable
-          || !accepts(schema, field.value, shape.kind === 'tuple' ? shape.items[index] : shape.item, depth + 1)) return false
+          || !accepts(schema, field.value, shape.kind === 'tuple' ? shape.items[index] : shape.item, depth + 1, validation)) return false
       }
       return true
     case 'set':
       if (!(value instanceof Set) || Object.getPrototypeOf(value) !== Set.prototype || Reflect.ownKeys(value).length > 0) return false
-      for (const item of value) if (!accepts(schema, item, shape.item, depth + 1)) return false
+      for (const item of value) if (!accepts(schema, item, shape.item, depth + 1, validation)) return false
       return true
     case 'map':
       if (!(value instanceof Map) || Object.getPrototypeOf(value) !== Map.prototype || Reflect.ownKeys(value).length > 0) return false
-      for (const [key, item] of value) if (!accepts(schema, key, shape.key, depth + 1) || !accepts(schema, item, shape.value, depth + 1)) return false
+      for (const [key, item] of value) if (!accepts(schema, key, shape.key, depth + 1, validation) || !accepts(schema, item, shape.value, depth + 1, validation)) return false
       return true
     case 'object': {
       if (value === null || typeof value !== 'object' || !plain(value)) return false
@@ -83,9 +95,9 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
         for (const field of shape.fields) {
           const descriptor = Object.getOwnPropertyDescriptor(value, field.name)
           if (descriptor === undefined) {
-            if (!field.optional && !accepts(schema, undefined, field.shape, depth + 1)) return false
+            if (!field.optional && !accepts(schema, undefined, field.shape, depth + 1, validation)) return false
           } else {
-            if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, field.shape, depth + 1)) return false
+            if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, field.shape, depth + 1, validation)) return false
             present++
           }
         }
@@ -95,7 +107,7 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
         for (const key of keys) {
           if (declared.has(key)) continue
           const descriptor = Object.getOwnPropertyDescriptor(value, key)!
-          if (!('value' in descriptor) || !descriptor.enumerable || !accepts(dataSchema, descriptor.value, 0, depth + 1)) return false
+          if (!('value' in descriptor) || !descriptor.enumerable || !accepts(dataSchema, descriptor.value, 0, depth + 1, validation)) return false
         }
         return true
       }
@@ -103,14 +115,14 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
       for (const field of shape.fields) {
         const descriptor = Object.hasOwn(descriptors, field.name) ? descriptors[field.name] : undefined
         if (descriptor === undefined) {
-          if (!field.optional && !accepts(schema, undefined, field.shape, depth + 1)) return false
+          if (!field.optional && !accepts(schema, undefined, field.shape, depth + 1, validation)) return false
           continue
         }
-        if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, field.shape, depth + 1)) return false
+        if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, field.shape, depth + 1, validation)) return false
         delete descriptors[field.name]
       }
       for (const descriptor of Object.values(descriptors)) {
-        if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, shape.index, depth + 1)) return false
+        if (!('value' in descriptor) || !descriptor.enumerable || !accepts(schema, descriptor.value, shape.index, depth + 1, validation)) return false
       }
       return true
     }
@@ -121,7 +133,7 @@ export function accepts(schema: Schema, value: unknown, id = schema.root, depth 
 // also check shared-object identity: equal fields with broken aliases differ.
 // knownSource is reserved for previously validated, owned checkpoint data. The
 // live destination still receives descriptor/prototype checks on every visit.
-export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, object>(), reverse: PairMap = new Map<object, object>(), copies?: Restoration['copies'], knownSource = false, added?: object[]): boolean {
+export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, object>(), reverse: PairMap = new Map<object, object>(), copies?: Restoration['copies'], knownSource = false, added?: object[], acceleration?: ComparisonAcceleration): boolean {
   if (Object.is(a, b)) return true
   if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
   const restored = copies?.get(a)
@@ -129,6 +141,7 @@ export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, o
   const previous = pairs.get(a)
   if (previous !== undefined) return previous === b
   if (reverse.has(b)) return false
+  if (acceleration?.match(a, b)) return true
   pairs.set(a, b)
   reverse.set(b, a)
   added?.push(a)
@@ -138,7 +151,7 @@ export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, o
     const other = b.entries()
     for (const [key, value] of a) {
       const item = other.next().value!
-      if (!equal(key, item[0], pairs, reverse, copies, knownSource, added) || !equal(value, item[1], pairs, reverse, copies, knownSource, added)) return false
+      if (!equal(key, item[0], pairs, reverse, copies, knownSource, added, acceleration) || !equal(value, item[1], pairs, reverse, copies, knownSource, added, acceleration)) return false
     }
     return true
   }
@@ -146,7 +159,7 @@ export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, o
     if (!(a instanceof Set) || !(b instanceof Set) || Object.getPrototypeOf(a) !== Set.prototype
       || Object.getPrototypeOf(b) !== Set.prototype || Reflect.ownKeys(a).length !== 0 || Reflect.ownKeys(b).length !== 0 || a.size !== b.size) return false
     const other = b.values()
-    for (const value of a) if (!equal(value, other.next().value, pairs, reverse, copies, knownSource, added)) return false
+    for (const value of a) if (!equal(value, other.next().value, pairs, reverse, copies, knownSource, added, acceleration)) return false
     return true
   }
   if (Array.isArray(a) || Array.isArray(b)) {
@@ -155,7 +168,7 @@ export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, o
     for (let index = 0; index < a.length; index++) {
       const left = knownSource ? { value: a[index], enumerable: true } : Object.getOwnPropertyDescriptor(a, index), right = Object.getOwnPropertyDescriptor(b, index)
       if (left === undefined || right === undefined || !('value' in left) || !('value' in right) || !left.enumerable || !right.enumerable
-        || !equal(left.value, right.value, pairs, reverse, copies, knownSource, added)) return false
+        || !equal(left.value, right.value, pairs, reverse, copies, knownSource, added, acceleration)) return false
     }
     return true
   }
@@ -166,7 +179,7 @@ export function equal(a: unknown, b: unknown, pairs: PairMap = new Map<object, o
     if (typeof key !== 'string') return false
     const left = knownSource ? { value: a[key], enumerable: true } : Object.getOwnPropertyDescriptor(a, key), right = Object.getOwnPropertyDescriptor(b, key)
     if (left === undefined || right === undefined || !('value' in left) || !('value' in right) || !left.enumerable || !right.enumerable
-      || !equal(left.value, right.value, pairs, reverse, copies, knownSource, added)) return false
+      || !equal(left.value, right.value, pairs, reverse, copies, knownSource, added, acceleration)) return false
   }
   return true
 }
@@ -191,8 +204,10 @@ export function comparison(copies?: Restoration['copies'], acceleration?: Compar
     const copy = source !== null && typeof source === 'object' ? copies?.get(source) : undefined
     if (copy !== undefined && copy.value !== current) return false
     if (acceleration?.match(source, current)) return true
+    const mark = acceleration?.mark()
     const added: object[] = []
-    if (equal(source, current, pairs, reverse, copies, true, added)) return true
+    if (equal(source, current, pairs, reverse, copies, true, added, acceleration)) return true
+    if (mark !== undefined) acceleration!.rollback(mark)
     for (const value of added) { reverse.delete(pairs.get(value)!); pairs.delete(value) }
     return false
   }
@@ -202,34 +217,42 @@ export function comparison(copies?: Restoration['copies'], acceleration?: Compar
 // Only owned checkpoint copies may enter this cache. Live values always require
 // a fresh comparison or validation. Weak keys do not retain old checkpoints.
 export function checkpointValidation() {
-  const validated = new WeakMap<Schema, WeakSet<object>>()
+  const validated = new WeakMap<Schema, Map<number, WeakSet<object>>>()
+  const owned: Validation = {
+    known: (schema, value, id) => validated.get(schema)?.get(id)?.has(value) ?? false,
+    remember(schema, value, id) {
+      let nodes = validated.get(schema)
+      if (nodes === undefined) { nodes = new Map(); validated.set(schema, nodes) }
+      let values = nodes.get(id)
+      if (values === undefined) { values = new WeakSet(); nodes.set(id, values) }
+      values.add(value)
+    },
+  }
+  function acceptsCopy(schema: Schema, value: unknown): value is Value { return accepts(schema, value, schema.root, 0, owned) }
+  function acceptsLive(schema: Schema, value: unknown, previous: Pick<PairMap, 'get'>): value is Value {
+    return accepts(schema, value, schema.root, 0, {
+      known(schema, value, id) { const copy = previous.get(value); return copy !== undefined && accepts(schema, copy, id, 0, owned) },
+      remember() {},
+    })
+  }
   function remember(schema: Schema, value: Value) {
-    if (value === null || typeof value !== 'object') return
-    let values = validated.get(schema)
-    if (values === undefined) { values = new WeakSet(); validated.set(schema, values) }
-    values.add(value)
+    if (!acceptsCopy(schema, value)) throw new Error('Captured checkpoint failed validation')
   }
-  function acceptsCopy(schema: Schema, value: unknown): value is Value {
-    if (value !== null && typeof value === 'object' && validated.get(schema)?.has(value)) return true
-    if (!accepts(schema, value)) return false
-    remember(schema, value)
-    return true
-  }
-  return { accepts: acceptsCopy, remember }
+  return { accepts: acceptsCopy, acceptsLive, remember }
 }
 
 export type Restoration = { copies: Copies; claimed: { has: (value: object) => boolean; add: (value: object) => void }; pass: number; settled: Pick<PairMap, 'get'> | undefined }
-export function restoration(matches: Pick<PairMap, 'get'> = new Map(), reverse: Pick<PairMap, 'has'> = new Map()): Restoration {
+export function restoration(matches: Pick<PairMap, 'get'> = new Map(), reverse: Pick<PairMap, 'has'> = new Map(), acceleration?: ComparisonAcceleration): Restoration {
   const changed: Copies['changed'] = new Map(), claimed = new Set<object>()
   const copies: Copies = {
     changed,
     get(source) {
       const copy = changed.get(source)
       if (copy !== undefined) return copy
-      const value = matches.get(source)
+      const value = matches.get(source) ?? acceleration?.reuseSource(source)
       return value === undefined ? undefined : { value: value as Container, pass: 0 }
     },
-    set(source, copy) { changed.set(source, copy) },
+    set(source, copy) { changed.set(source, copy); acceleration?.added(source, copy.value) },
   }
   return { copies, claimed: { has: value => claimed.has(value) || reverse.has(value), add: value => { claimed.add(value) } }, pass: 0, settled: undefined }
 }

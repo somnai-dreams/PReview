@@ -48,8 +48,10 @@ export function parseTransferLog(raw: unknown) {
   const timing = object(input['timing'])
   return { version: 1 as const, session, sequence: number(input['sequence'], Number.MAX_SAFE_INTEGER, true), builds: ids, source, destination, engine, outcome,
     milliseconds: number(input['milliseconds'], 86400000),
-    counts: fields(input['counts'], ['restored', 'absent', 'rejected', 'secondPass', 'changed', 'retained', 'transferred', 'sourceSkipped', 'destinationSkipped'], true),
+    counts: fields(input['counts'], ['restored', 'absent', 'rejected', 'secondPass', 'changed', 'retained', 'transferred', 'sourceSkipped', 'destinationSkipped', 'copiedObjects', 'patchedObjects', 'reusedObjects', 'heapBytes'], true),
+    rejectionReasons: fields(input['rejectionReasons'] ?? {}, ['hook-kind-mismatch', 'incoming-value-invalid', 'live-ref-invalid', 'multiple-instances-after-commit'], true),
+    rejectionPhases: fields(input['rejectionPhases'] ?? {}, ['validation', 'repair', 'verification'], true),
     sourceIndex: index(input['sourceIndex']), destinationIndex: index(input['destinationIndex']),
-    timing: { ...fields(timing, ['routeWaitMs', 'presentationMs', 'captureMs', 'comparisonMs', 'decodeMs', 'validationMs', 'firstCommitMs', 'secondCommitMs', 'verificationMs', 'restoreMs']),
+    timing: { ...fields(timing, ['routeWaitMs', 'presentationMs', 'captureMs', 'comparisonMs', 'decodeMs', 'validationMs', 'firstCommitMs', 'secondCommitMs', 'verificationMs', 'restoreMs', 'validationAndScrollMs', 'encodeMs', 'decodeAndValidateMs', 'captureIndexMs', 'repairCheckMs', 'repairIndexMs', 'repairCommitMs']),
       commands: commands(timing['commands']), routePreparation: commands(timing['routePreparation']) } }
 }

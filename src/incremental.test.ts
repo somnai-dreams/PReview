@@ -89,3 +89,18 @@ test('invalid accessors and collection order changes cannot receive a cached mat
   indexedMap.cache.touch(map, 'delete'); map.delete('a'); map.set('a', 1)
   expect(indexedMap.matches()).toBe(false)
 })
+
+test('dirty descendants propagate across shared parents and release with their checkpoint', () => {
+  const shared = { value: 1 }, target = { left: [shared, shared], right: { shared } }
+  const { cache, source, matches } = indexed(target)
+  cache.touch(shared, 'property', 'value').value = 2
+  expect(matches()).toBe(false)
+  expect(comparison(undefined, cache.phase()).matches(source.right, target.right)).toBe(false)
+  cache.touch(shared, 'property', 'value').value = 1
+  expect(matches()).toBe(true)
+  cache.keep([{ source: source.right, target: target.right }])
+  cache.touch(shared, 'property', 'value').value = 3
+  expect(comparison(undefined, cache.phase()).matches(source.right, target.right)).toBe(false)
+  cache.clear()
+  expect(cache.stats().indexedObjects).toBe(0)
+})

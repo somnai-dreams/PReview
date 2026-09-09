@@ -5,12 +5,13 @@ import { reviewerResponse } from './host'
 const report = {
   version: 1 as const, session: '10000000-0000-4000-8000-000000000001', sequence: 2, builds: ['build-a', 'build-b'], source: 1, destination: 0,
   engine: 'incremental', outcome: 'restored', milliseconds: 1200,
+  rejectionReasons: { 'incoming-value-invalid': 1 }, rejectionPhases: { validation: 1 },
   counts: { restored: 12, retained: 9, transferred: 3 }, sourceIndex: { enabled: true, coverage: true, indexedObjects: 10000 }, destinationIndex: null,
   timing: { captureMs: 300, restoreMs: 800, commands: [{ build: 1, operation: 'capture', failed: false, roundTripMs: 350 }], routePreparation: [] },
 }
 
 test('logging preserves phase timings but cannot upload state or diagnostic strings', () => {
-  const result = parseTransferLog({ ...report, snapshot: { draft: 'private' }, error: 'private', recent: ['private'],
+  const result = parseTransferLog({ ...report, rejectionReasons: { ...report.rejectionReasons, 'private-cell-name': 1 }, snapshot: { draft: 'private' }, error: 'private', recent: ['private'],
     counts: { ...report.counts, values: ['private'] }, sourceIndex: { ...report.sourceIndex, path: 'private' },
     timing: { ...report.timing, route: 'private', commands: [{ ...report.timing.commands[0], error: 'private', snapshot: 'private' }] } })
   expect(result).toEqual(report)

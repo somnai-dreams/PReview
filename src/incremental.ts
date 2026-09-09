@@ -1,16 +1,16 @@
 import type { ComparisonAcceleration } from './values'
 
-type Proof = { source: object; target: object; records: Link[]; changed: number }
-type Link = { source: object; target: object; proofs: Proof[]; differences: Set<PropertyKey> | undefined; different: boolean; fields: Set<PropertyKey> | null | undefined }
+type Link = { source: object; target: object; parents: Link[]; children: Link[]; roots: number; different: boolean; dirtyChildren: number; differences: Set<PropertyKey> | undefined; fields: Set<PropertyKey> | null | undefined }
 const container = (value: unknown): value is object => value !== null && typeof value === 'object'
+const dirty = (link: Link) => link.different || link.dirtyChildren !== 0
 
-// One frame owns one checkpoint and its verified live correspondences. Writes
-// name changed fields; the index lifetime is independent of ordinary edits.
+// One link per owned/live object pair. Edges propagate changes to ancestors,
+// while unchanged siblings retain their own proof and can be reused separately.
 export function incrementalCache() {
   const sourceLinks = new WeakMap<object, Link>(), targetLinks = new WeakMap<object, Link>()
-  const proofs = new Map<object, Proof>(), touched = new Set<Link>()
+  const touched = new Set<Link>()
+  let roots: Link[] = [], enabled = true, coverage = true
   const metrics = { indexedObjects: 0, indexedRoots: 0, fieldChecks: 0, shallowChecks: 0, hits: 0, misses: 0, drainMs: 0, indexMs: 0 }
-  let enabled = true, coverage = true
   function touch<T>(value: T, operation = 'property', field?: PropertyKey): T {
     if (!container(value)) return value
     const link = targetLinks.get(value)
@@ -48,6 +48,13 @@ export function incrementalCache() {
     }
     return true
   }
+  function changed(link: Link, difference: number) {
+    for (const parent of link.parents) {
+      const before = dirty(parent)
+      parent.dirtyChildren += difference
+      if (before !== dirty(parent)) changed(parent, dirty(parent) ? 1 : -1)
+    }
+  }
   function drain() {
     if (touched.size === 0) return
     const started = performance.now()
@@ -55,8 +62,6 @@ export function incrementalCache() {
       let different: boolean
       if (link.fields === null) {
         different = !shallow(link)
-        // An unknown write can affect collection order, prototype or keys. Keep
-        // checking this whole container until it matches the checkpoint again.
         if (!different) { link.fields = undefined; link.differences = undefined }
       } else {
         for (const key of link.fields ?? []) {
@@ -66,88 +71,121 @@ export function incrementalCache() {
         link.fields = undefined
         different = (link.differences?.size ?? 0) !== 0
       }
-      if (different !== link.different) {
-        for (const proof of link.proofs) proof.changed += different ? 1 : -1
-        link.different = different
-      }
+      const before = dirty(link)
+      link.different = different
+      if (before !== dirty(link)) changed(link, dirty(link) ? 1 : -1)
     }
     touched.clear()
     metrics.drainMs += performance.now() - started
   }
-  function release(proof: Proof) {
-    for (const link of proof.records) {
-      link.proofs.splice(link.proofs.indexOf(proof), 1)
-      if (link.proofs.length === 0) { sourceLinks.delete(link.source); targetLinks.delete(link.target); touched.delete(link); metrics.indexedObjects-- }
+  function release(link: Link) {
+    if (link.roots !== 0 || link.parents.length !== 0) return
+    if (sourceLinks.get(link.source) === link) sourceLinks.delete(link.source)
+    if (targetLinks.get(link.target) === link) targetLinks.delete(link.target)
+    touched.delete(link); metrics.indexedObjects--
+    for (const child of link.children) {
+      child.parents.splice(child.parents.indexOf(link), 1)
+      release(child)
     }
-    proofs.delete(proof.source)
   }
-  function clear() { for (const proof of proofs.values()) release(proof) }
-  function keep(roots: { source: unknown; target: unknown }[]) {
+  function clear() {
+    for (const root of roots) { root.roots--; release(root) }
+    roots = []
+  }
+  function keep(values: { source: unknown; target: unknown }[]) {
     drain()
     if (!enabled || !coverage) { clear(); return }
-    const started = performance.now()
-    const present = new Map<object, object>()
-    for (const {source, target} of roots) if (container(source) && container(target)) present.set(source, target)
-    for (const proof of proofs.values()) if (present.get(proof.source) !== proof.target || proof.changed !== 0) release(proof)
-    for (const [source, target] of present) {
-      if (proofs.has(source)) continue
-      const proof: Proof = { source, target, records: [], changed: 0 }
-      proofs.set(source, proof)
-      const seen = new Set<object>(), pending: [object, object][] = [[source, target]]
-      for (let cursor = 0; cursor < pending.length; cursor++) {
-        const [a, b] = pending[cursor]!
-        if (seen.has(a)) continue
-        seen.add(a)
-        let link = sourceLinks.get(a)
-        const other = targetLinks.get(b)
-        // A previously retained proof must never keep an incompatible alias.
-        if (link !== undefined && link.target !== b || other !== undefined && other.source !== a) {
-          clear()
-          // This should have been rejected by the shared comparison. Fall back
-          // for this checkpoint instead of certifying contradictory mappings.
-          metrics.indexMs += performance.now() - started
-          return
-        }
-        if (link === undefined) {
-          link = { source: a, target: b, proofs: [], differences: undefined, different: false, fields: undefined }
-          sourceLinks.set(a, link); targetLinks.set(b, link); metrics.indexedObjects++
-        }
-        proof.records.push(link); link.proofs.push(proof)
-        function child(left: unknown, right: unknown) { if (container(left)) pending.push([left, right as object]) }
-        if (a instanceof Map && b instanceof Map) {
-          const values = b.entries()
-          for (const [key, value] of a) { const row = values.next().value!; child(key, row[0]); child(value, row[1]) }
-        } else if (a instanceof Set && b instanceof Set) {
-          const values = b.values()
-          for (const value of a) child(value, values.next().value)
-        } else {
-          for (const key of Object.keys(a)) child(Reflect.get(a, key), Reflect.get(b, key))
-        }
+    const started = performance.now(), next: Link[] = [], built = new Map<object, Link>(), targets = new Map<object, object>()
+    function visit(source: object, target: object): Link {
+      const existing = built.get(source)
+      if (existing !== undefined) {
+        if (existing.target !== target) throw new Error('Conflicting checkpoint aliases')
+        return existing
       }
-      proofs.set(source, proof); metrics.indexedRoots++
+      const previous = sourceLinks.get(source)
+      if (previous !== undefined && previous.target === target && !dirty(previous)) return previous
+      const used = targets.get(target)
+      if (used !== undefined && used !== source) throw new Error('Conflicting checkpoint identities')
+      targets.set(target, source)
+      const link: Link = { source, target, parents: [], children: [], roots: 0, different: false, dirtyChildren: 0, differences: undefined, fields: undefined }
+      built.set(source, link); sourceLinks.set(source, link); targetLinks.set(target, link); metrics.indexedObjects++
+      function child(a: unknown, b: unknown) {
+        if (!container(a)) return
+        if (!container(b)) throw new Error('Invalid checkpoint correspondence')
+        const entry = visit(a, b)
+        link.children.push(entry); entry.parents.push(link)
+      }
+      if (source instanceof Map && target instanceof Map) {
+        const other = target.entries()
+        for (const [key, value] of source) { const row = other.next().value!; child(key, row[0]); child(value, row[1]) }
+      } else if (source instanceof Set && target instanceof Set) {
+        const other = target.values()
+        for (const value of source) child(value, other.next().value)
+      } else {
+        for (const key of Object.keys(source)) child(Reflect.get(source, key), Reflect.get(target, key))
+      }
+      return link
     }
+    // Acquire new roots before releasing old roots: most descendants are shared
+    // with the previous checkpoint, so their watches survive without rebuilding.
+    for (const { source, target } of values) {
+      if (!container(source) || !container(target)) continue
+      const root = visit(source, target)
+      root.roots++; next.push(root)
+      if (built.has(source)) metrics.indexedRoots++
+    }
+    for (const root of roots) { root.roots--; release(root) }
+    roots = next
     metrics.indexMs += performance.now() - started
   }
   function phase(): ComparisonAcceleration | undefined {
     drain()
-    if (!enabled || !coverage || proofs.size === 0) return undefined
-    const active = new Set<Proof>(), blocked = new Map<Proof, number>()
-    function conflicts(source: object, target: object, difference: number) {
-      const sourceLink = sourceLinks.get(source), targetLink = targetLinks.get(target)
-      for (const link of [sourceLink?.target === target ? undefined : sourceLink, targetLink?.source === source ? undefined : targetLink]) {
-        if (link === undefined) continue
-        for (const proof of link.proofs) blocked.set(proof, (blocked.get(proof) ?? 0) + difference)
+    if (!enabled || !coverage || roots.length === 0) return undefined
+    const active = new Set<Link>(), activations: Link[] = [], blocked = new Map<Link, number>()
+    function activate(link: Link) { if (!active.has(link)) { active.add(link); activations.push(link) } }
+    function isActive(link: Link): boolean {
+      if (active.has(link)) return true
+      for (const parent of link.parents) if (active.has(parent)) return true
+      const pending = [...link.parents], seen = new Set<Link>()
+      for (let index = 0; index < pending.length; index++) {
+        const parent = pending[index]!
+        if (seen.has(parent)) continue
+        seen.add(parent)
+        for (const ancestor of parent.parents) {
+          if (active.has(ancestor)) return true
+          pending.push(ancestor)
+        }
       }
+      return false
+    }
+    function conflicts(source: object, target: object, difference: number) {
+      const a = sourceLinks.get(source), b = targetLinks.get(target), seen = new Set<Link>()
+      function block(link: Link) {
+        if (seen.has(link)) return
+        seen.add(link); blocked.set(link, (blocked.get(link) ?? 0) + difference)
+        for (const parent of link.parents) block(parent)
+      }
+      if (a !== undefined && a.target !== target) block(a)
+      if (b !== undefined && b.source !== source) block(b)
+    }
+    function reusable(link: Link | undefined) {
+      if (link === undefined || dirty(link) || (blocked.get(link) ?? 0) !== 0) return false
+      activate(link); metrics.hits++; return true
     }
     return {
+      baseTarget: target => targetLinks.get(target)?.source,
+      mark: () => activations.length,
+      rollback(mark) { for (let index = activations.length - 1; index >= mark; index--) active.delete(activations[index]!); activations.length = mark },
       match(source, target) {
         if (!container(source)) return false
-        const proof = proofs.get(source)
-        if (proof === undefined || proof.target !== target || proof.changed !== 0 || (blocked.get(proof) ?? 0) !== 0) { metrics.misses++; return false }
-        active.add(proof); metrics.hits++; return true
+        const link = sourceLinks.get(source)
+        if (link?.target === target && reusable(link)) return true
+        metrics.misses++; return false
       },
-      get(source) { const link = sourceLinks.get(source); return link?.proofs.some(proof => active.has(proof)) ? link.target : undefined },
-      reverse(target) { const link = targetLinks.get(target); return link?.proofs.some(proof => active.has(proof)) ? link.source : undefined },
+      get(source) { const link = sourceLinks.get(source); return link !== undefined && isActive(link) ? link.target : undefined },
+      reverse(target) { const link = targetLinks.get(target); return link !== undefined && isActive(link) ? link.source : undefined },
+      reuseSource(source) { const link = sourceLinks.get(source); return reusable(link) ? link!.target : undefined },
+      reuseTarget(target) { const link = targetLinks.get(target); return reusable(link) ? link!.source : undefined },
       added(source, target) { conflicts(source, target, 1) },
       removed(source, target) { conflicts(source, target, -1) },
     }
@@ -155,6 +193,6 @@ export function incrementalCache() {
   return { touch, keep, phase, clear,
     configure(mode: 'full' | 'incremental') { enabled = mode === 'incremental'; if (!enabled) clear() },
     coverage(complete: boolean) { coverage = complete; if (!complete) clear() },
-    stats: () => ({ ...metrics, enabled: enabled && coverage, coverage, roots: proofs.size, pending: touched.size }),
+    stats: () => ({ ...metrics, enabled: enabled && coverage, coverage, roots: roots.length, pending: touched.size }),
   }
 }

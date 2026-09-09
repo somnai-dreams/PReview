@@ -26,6 +26,9 @@ let markMounted
 const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
 let checkpoint = null
+// A rejected payload is still a received wire baseline. Keep at most one so a
+// retry can decode its delta without claiming any application state was applied.
+let rejectedCheckpoint = null
 let interacted = false
 for (const type of ['pointerdown','keydown','input']) addEventListener(type,event=>{if(event.isTrusted)interacted=true},{capture:true})
 function publishNavigation() {
@@ -123,7 +126,8 @@ function capture() {
     if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
   }
   const previous = checkpoint === null ? [] : checkpoint.snapshot.values.map(saved => ({ ...saved, owner: checkpoint.owners.get(saved.id) }))
-  const { retained, reverse } = checkpoint === null ? { retained: new Set(), reverse: new Map() } : retainedCells(previous, candidates, incremental?.phase())
+  const captureReuse = incremental?.phase()
+  const { retained, reverse } = checkpoint === null ? { retained: new Set(), reverse: new Map() } : retainedCells(previous, candidates, captureReuse)
   const comparisonMs = performance.now() - started
   const priorValues = new Map(previous.map(saved => [saved.id, saved]))
   const owners = new Map()
@@ -132,7 +136,7 @@ function capture() {
     const cell = instances[0]
     const value = cell.read()
     const matched = reverse.get(value)
-    if (!retained.has(id) && !(matched === undefined ? accepts(cell.schema, value) : validation.accepts(cell.schema, matched))) {
+    if (!retained.has(id) && !(matched === undefined ? validation.acceptsLive(cell.schema, value, reverse) : validation.accepts(cell.schema, matched))) {
       const root = cell.schema.nodes[cell.schema.root]
       skipped.push({ id, reason: root.kind === 'reject' ? root.reason : 'unsupported value or type' })
       continue
@@ -160,7 +164,9 @@ function capture() {
   // Copy changed data and reconnect its references to the retained checkpoint.
   const changedValues = values.filter(saved => !retained.has(saved.id))
   const baseObjects = checkpoint?.snapshot.values.map(saved => saved.value) ?? []
-  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, reverse)
+  const encodingAt = performance.now()
+  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, reverse, captureReuse?.baseTarget)
+  const encodedAt = performance.now()
   const decoded = decodeValues(encoded.values, encoded.references, baseObjects)
   const snapshot = structuredClone({ skipped, scroll, history: navigation, session })
   snapshot.values = changedValues.map((saved, index) => ({ ...saved, value: decoded[index] }))
@@ -169,12 +175,15 @@ function capture() {
   const entries = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, reuse: true } : encodedById.get(saved.id))
   snapshot.values = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, value: priorValues.get(saved.id).value } : changed.get(saved.id))
   for (const saved of snapshot.values) validation.remember(owners.get(saved.id).schema, saved.value)
+  const indexingAt = performance.now()
   incremental?.keep(snapshot.values.map(saved => ({ source: saved.value, target: owners.get(saved.id).read() })))
   snapshot.captureMs = performance.now() - started
   snapshot.comparisonMs = comparisonMs
+  snapshot.captureDetails = { validationAndScrollMs: encodingAt - started - comparisonMs, encodeMs: encodedAt - encodingAt, decodeAndValidateMs: indexingAt - encodedAt, captureIndexMs: performance.now() - indexingAt, heapBytes: performance.memory?.usedJSHeapSize, copiedObjects: encoded.copiedObjects, patchedObjects: encoded.patchedObjects, reusedObjects: encoded.reusedObjects }
   snapshot.incremental = incremental?.stats()
   const base = checkpoint?.id ?? null, id = crypto.randomUUID()
   checkpoint = { id, snapshot, owners }
+  rejectedCheckpoint = null
   return { ...snapshot, values: entries, references: encoded.references, base, id }
 }
 
@@ -182,11 +191,12 @@ function restore(packet) {
   const started = performance.now()
   if (typeof packet.id !== 'string' || !(packet.base === null || typeof packet.base === 'string')) throw new Error('Invalid checkpoint identity')
   if (packet.base === null && (packet.values.some(saved => saved.reuse === true) || packet.references?.length)) throw new Error('A full checkpoint cannot contain references')
-  if (packet.base !== null && checkpoint?.id !== packet.base) return { needsFull: true }
+  const baseCheckpoint = checkpoint?.id === packet.base ? checkpoint : rejectedCheckpoint?.id === packet.base ? rejectedCheckpoint : null
+  if (packet.base !== null && baseCheckpoint === null) return { needsFull: true }
   const changedValues = packet.values.filter(saved => saved.reuse !== true)
-  const decoded = decodeValues(changedValues.map(saved => saved.value), packet.references ?? [], checkpoint?.snapshot.values.map(saved => saved.value) ?? [])
+  const decoded = decodeValues(changedValues.map(saved => saved.value), packet.references ?? [], baseCheckpoint?.snapshot.values.map(saved => saved.value) ?? [])
   const decodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: decoded[index] }]))
-  const old = new Map(checkpoint?.snapshot.values.map(saved => [saved.id, saved]) ?? [])
+  const old = new Map(baseCheckpoint?.snapshot.values.map(saved => [saved.id, saved]) ?? [])
   const reused = new Set()
   const values = packet.values.map(saved => {
     if (saved.reuse !== true) return decodedById.get(saved.id)
@@ -201,8 +211,9 @@ function restore(packet) {
   for (const [id, instances] of cells) {
     if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
   }
+  const reuse = incremental?.phase()
   const { retained, matches, reverse } = reused.size === 0 ? { retained: new Set(), matches: new Map(), reverse: new Map() } : retainedCells(
-    values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? checkpoint.owners.get(saved.id) : saved })), candidates, incremental?.phase())
+    values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? baseCheckpoint.owners.get(saved.id) : saved })), candidates, reuse)
   const restored = [], rejections = [], skipped = [], absent = [], plan = []
   for (const saved of snapshot.values) {
     const instances = cells.get(saved.id)
@@ -210,20 +221,23 @@ function restore(packet) {
     if (instances.length !== 1) { skipped.push({ id: saved.id, reason: 'multiple instances', count: instances.length }); continue }
     if (retained.has(saved.id)) { restored.push(saved.id); continue }
     const current = instances[0].read(), matched = reverse.get(current)
-    const validatedBefore = reused.has(saved.id) && checkpoint.owners.get(saved.id) === instances[0]
+    const validatedBefore = reused.has(saved.id) && baseCheckpoint.owners.get(saved.id) === instances[0]
     const reason = instances[0].kind !== saved.kind ? 'hook-kind-mismatch'
       : !validatedBefore && !validation.accepts(instances[0].schema, saved.value) ? 'incoming-value-invalid'
-      : saved.kind === 'ref' && !(matched === undefined ? accepts(instances[0].schema, current) : validation.accepts(instances[0].schema, matched)) ? 'live-ref-invalid' : null
+      : saved.kind === 'ref' && !(matched === undefined ? validation.acceptsLive(instances[0].schema, current, { get: value => reverse.get(value) ?? reuse?.reuseTarget(value) }) : validation.accepts(instances[0].schema, matched)) ? 'live-ref-invalid' : null
     if (reason !== null) { rejections.push({ id: saved.id, reason, phase: 'validation' }); continue }
     plan.push({ saved, cell: instances[0] })
     restored.push(saved.id)
   }
   const validated = performance.now()
-  if (rejections.length > 0) return { restored: [], rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent, incremental: incremental?.stats(),
+  if (rejections.length > 0) {
+    rejectedCheckpoint = { id: packet.id, snapshot, owners: new Map() }
+    return { restored: [], rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent, incremental: incremental?.stats(),
     timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: 0, secondCommitMs: 0, verificationMs: 0, restoreMs: performance.now() - started } }
+  }
   // Ambiguous owners stay local for this entire transfer, including remounts.
   const transferable = snapshot.values.filter(saved => !skipped.some(item => item.id === saved.id))
-  pending = { values: transferable, context: restoration(matches, reverse) }
+  pending = { values: transferable, context: restoration(matches, { has: value => reverse.get(value) !== undefined }, reuse) }
   function applyValues(entries) {
     // Validation precedes this synchronous commit. Refs establish canonical
     // container identities before state that may point into the same graph.
@@ -251,7 +265,7 @@ function restore(packet) {
     if (instances.length !== 1) { rejections.push({ id: saved.id, reason: 'multiple-instances-after-commit', count: instances.length, phase: 'repair' }); continue }
     if (instances[0].kind !== saved.kind) { rejections.push({ id: saved.id, reason: 'hook-kind-mismatch', phase: 'repair' }); continue }
     const cell = instances[0]
-    const known = retained.has(saved.id) && checkpoint.owners.get(saved.id) === cell || plan.some(entry => entry.saved === saved && entry.cell === cell)
+    const known = retained.has(saved.id) && baseCheckpoint.owners.get(saved.id) === cell || plan.some(entry => entry.saved === saved && entry.cell === cell)
     if (!known && !validation.accepts(cell.schema, saved.value)) { rejections.push({ id: saved.id, reason: 'incoming-value-invalid', phase: 'repair' }); continue }
     if (repairComparison.matches(saved.value, cell.read())) {
       settled.push({ source: saved.value, target: cell.read() })
@@ -262,11 +276,14 @@ function restore(packet) {
     repairs.push({ saved, cell })
   }
   const secondPass = repairs.map(entry => entry.saved.id)
+  const repairCheckedAt = performance.now()
+  let repairIndexedAt = repairCheckedAt
   const repaired = rejections.length === 0 && repairs.length > 0
   if (repaired) {
     // These roots were just checked. Keep their proofs across the repair commit
     // so observed effect writes invalidate only the graphs they actually touch.
     incremental?.keep(settled)
+    repairIndexedAt = performance.now()
     pending.context.pass++
     // Repair can alias a large, already settled ref. Reuse its verified objects
     // rather than rewriting them because the outer ref needs another commit.
@@ -305,10 +322,13 @@ function restore(packet) {
     element.scrollTo(saved.left, top)
     scrollRestored.push({id:saved.id,method})
   }
-  if (rejections.length === 0) checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
+  if (rejections.length === 0) {
+    checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
+    rejectedCheckpoint = null
+  } else rejectedCheckpoint = { id: packet.id, snapshot, owners: new Map() }
   if (rejections.length === 0) incremental?.keep(snapshot.values.flatMap(saved => { const instances = cells.get(saved.id); return instances?.length === 1 && restored.includes(saved.id) && !changed.includes(saved.id) ? [{source:saved.value,target:instances[0].read()}] : [] }))
   return { incremental: incremental?.stats(), restored, rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
-    timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, verificationMs: performance.now() - secondCommit, restoreMs: performance.now() - started } }
+    timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, repairCheckMs: repairCheckedAt - firstCommit, repairIndexMs: repairIndexedAt - repairCheckedAt, repairCommitMs: secondCommit - repairIndexedAt, verificationMs: performance.now() - secondCommit, restoreMs: performance.now() - started } }
   } finally { pending = null }
 }
 

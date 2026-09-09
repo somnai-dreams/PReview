@@ -63,11 +63,17 @@ function logTransfer(report, source, destination) {
   setTimeout(async () => {
     try {
       const command = item => ({ ...item, failed: item.error !== undefined });
+      const reasons = report.rejectionDetails ?? [];
+      const frequencies = (key, values) => Object.fromEntries(values.map(value => [value, reasons.filter(item => item[key] === value).length]));
       const payload = parseTransferLog({ version: 1, session, sequence: report.transfer.sequence, builds: logConfig.buildIds,
         source, destination, engine: report.engine, outcome: report.outcome, milliseconds: report.milliseconds,
         counts: { restored: report.restored?.length, absent: report.absent?.length, rejected: report.rejected?.length,
           secondPass: report.secondPass?.length, changed: report.changed?.length, retained: report.retained, transferred: report.transferred,
-          sourceSkipped: report.keptLocal.source?.length, destinationSkipped: report.keptLocal.destination?.length },
+          sourceSkipped: report.keptLocal.source?.length, destinationSkipped: report.keptLocal.destination?.length,
+          copiedObjects: report.timing.capture.copiedObjects, patchedObjects: report.timing.capture.patchedObjects,
+          reusedObjects: report.timing.capture.reusedObjects, heapBytes: report.timing.capture.heapBytes },
+        rejectionReasons: frequencies('reason', ['hook-kind-mismatch', 'incoming-value-invalid', 'live-ref-invalid', 'multiple-instances-after-commit']),
+        rejectionPhases: frequencies('phase', ['validation', 'repair', 'verification']),
         sourceIndex: report.sourceIndex ?? null, destinationIndex: report.destinationIndex ?? null,
         timing: { ...report.timing, ...report.timing.capture, ...report.timing.restore,
           commands: report.timing.commands.map(command), routePreparation: (report.timing.routePreparation ?? []).map(command) } });
@@ -226,7 +232,7 @@ async function swap(index) {
       restored: result?.restored, absent: result?.absent, rejected: result?.rejected, rejectionDetails: result?.rejectionDetails,
       secondPass: result?.secondPass, changed: result?.changed, retained: result?.retained, transferred: result?.transferred,
       keptLocal: { source: snapshot?.skipped, destination: result?.skipped },
-      timing: { ...record.timing, capture: { captureMs: snapshot?.captureMs, comparisonMs: snapshot?.comparisonMs }, restore: result?.timing }, recent: benchmarkRecords.slice() };
+      timing: { ...record.timing, capture: { captureMs: snapshot?.captureMs, comparisonMs: snapshot?.comparisonMs, ...snapshot?.captureDetails }, restore: result?.timing }, recent: benchmarkRecords.slice() };
     details.hidden = false; copyStatus.textContent = '';
     logStatus.textContent = logConfig === null ? '' : 'Saving timing…';
     if (details.open) renderReport(); else report.textContent = '';

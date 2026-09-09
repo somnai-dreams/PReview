@@ -387,3 +387,23 @@ test('an additive field survives a round trip through an older structural object
   expect(a.restore(structuredClone(b.capture())).rejected).toEqual([])
   expect(source.cell.read()).toEqual({ title: 'edited in older build', badge: { color: 'blue' } })
 })
+
+test('rejected deltas remain decodable on retry without becoming validated application state', () => {
+  const source = cell('value', 'ref', { count: 1 }), destination = cell('value', 'ref', { count: 0 })
+  destination.cell.schema = { root: 0, nodes: [{ kind: 'object', fields: [{ name: 'count', optional: false, shape: 1 }], index: null }, { kind: 'primitive', name: 'number' }] }
+  const a = harness(() => {}, true, incrementalCache()).runtime, b = harness(() => {}, true, incrementalCache()).runtime
+  a.register(source.cell); b.register(destination.cell)
+  expect(b.restore(structuredClone(a.capture())).rejected).toEqual([])
+  source.reset({ count: 'incompatible' })
+  const rejected = b.restore(structuredClone(a.capture()))
+  expect(rejected.rejectionDetails).toEqual([{ id: 'value', reason: 'incoming-value-invalid', phase: 'validation' }])
+  const retry = b.restore(structuredClone(a.capture()))
+  expect(retry.needsFull).toBeUndefined()
+  expect(retry.rejected).toEqual(['value'])
+  expect(destination.cell.read()).toEqual({ count: 1 })
+  source.reset({ count: 2 })
+  const corrected = b.restore(structuredClone(a.capture()))
+  expect(corrected.needsFull).toBeUndefined()
+  expect(corrected.rejected).toEqual([])
+  expect(destination.cell.read()).toEqual({ count: 2 })
+})
