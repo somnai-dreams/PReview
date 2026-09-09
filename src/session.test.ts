@@ -77,3 +77,44 @@ test('a deferred restore starts authentication immediately but cannot write unti
     }
   }
 })
+
+test('direct capture sends shared data only through the peer port and closes it on success or auth failure', async () => {
+  for (const authorized of [true, false]) {
+    const shared = { title: 'private job' }, data = { first: shared, selected: shared }
+    const peers: { snapshot?: { values: { value: typeof data }[] }; error?: string }[] = []
+    const replies: { result?: Record<string, unknown>; error?: string }[] = []
+    let closed = 0
+    const parent = { postMessage(message: typeof replies[number]) { replies.push(message) } }
+    const port = { postMessage(message: typeof peers[number]) { peers.push(structuredClone(message)) }, close() { closed++ } }
+    let receive!: (event: { source: object; origin: string; data: object; ports: typeof port[] }) => Promise<void>
+    const source = (await Bun.file(new URL('./runtime.js', import.meta.url)).text())
+      .replace(/^import .*$/gm, '').replaceAll('export function ', 'function ')
+      .replace('const authorizeSession = null', 'const authorizeSession = sessionCheck')
+    runInNewContext(source + '\n cells.set("jobs",[{id:"jobs",kind:"ref",schema:{root:0,nodes:[{kind:"data"}]},read:()=>data}]); markMounted()', {
+      ...values, retainedCells, encodeValues, decodeValues, crypto, performance, URL, DOMException, structuredClone,
+      parent, window: {}, data, sessionCheck: () => { if (!authorized) throw new Error('Signed out'); return { account: 'alice', environment: 'test' } },
+      history: { state: null, replaceState() {} },
+      location: { pathname: '/', search: '', hash: '', origin: 'https://a.example', href: 'https://a.example/' },
+      document: { querySelectorAll: () => [] },
+      addEventListener(type: string, callback: typeof receive) { if (type === 'message') receive = callback },
+    })
+    await receive({ source: parent, origin: '__PREVIEW_ORIGIN__', data: { channel: 'preview-state', id: 1, operation: 'capture' }, ports: [port] })
+    expect(closed).toBe(1)
+    expect(peers).toHaveLength(1)
+    expect(replies).toHaveLength(1)
+    if (authorized) {
+      const received = peers[0]!.snapshot!.values[0]!.value
+      expect(received).toEqual(data)
+      expect(received.selected).toBe(received.first)
+      expect(received.first).not.toBe(shared)
+      expect(replies[0]!.result!['values']).toBeUndefined()
+      expect(replies[0]!.result!['history']).toBeUndefined()
+      expect(replies[0]!.result!['session']).toBeUndefined()
+      expect(JSON.stringify(replies)).not.toContain('private job')
+    } else {
+      expect(peers[0]!.snapshot).toBeUndefined()
+      expect(peers[0]!.error).toContain('Signed out')
+      expect(replies[0]!.error).toContain('Signed out')
+    }
+  }
+})

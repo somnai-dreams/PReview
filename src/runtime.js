@@ -340,7 +340,7 @@ globalThis.__preview = { capture, restore }
 function receiveTransfer(port) {
   let timer
   const promise = new Promise((resolve, reject) => {
-    timer = setTimeout(() => reject(new Error('Source capture did not complete')), 5000)
+    timer = setTimeout(() => reject(new Error('Source capture did not complete')), 60000)
     port.onmessage = event => {
       const payload = event.data
       if (payload === null || typeof payload !== 'object') { reject(new Error('Invalid transfer payload')); return }
@@ -356,6 +356,7 @@ addEventListener('message', async event => {
   if (event.source !== parent || parent === window || event.origin !== reviewerOrigin) return
   const message = event.data
   if (message === null || typeof message !== 'object' || message.channel !== 'preview-state' || !Number.isSafeInteger(message.id)) return
+  const outgoing = (message.operation === 'capture' || message.operation === 'checkpoint') && event.ports?.length === 1 ? event.ports[0] : null
   let result
   const receivedAt = performance.now()
   let authorizedAt = null, payloadAt = receivedAt, operationAt = null
@@ -414,8 +415,15 @@ addEventListener('message', async event => {
     }
     default: return
   }
+  if (outgoing !== null) {
+    const sendingAt = performance.now()
+    outgoing.postMessage({ snapshot: result })
+    result = { skipped: result.skipped, incremental: result.incremental, captureMs: result.captureMs,
+      comparisonMs: result.comparisonMs, captureDetails: { ...result.captureDetails, sendMs: performance.now() - sendingAt } }
+  }
   parent.postMessage({ channel: 'preview-state', id: message.id, result, timing: timing() }, event.origin)
   } catch (error) {
+    outgoing?.postMessage({ error: error instanceof Error ? error.message : String(error) })
     parent.postMessage({ channel: 'preview-state', id: message.id, error: error instanceof Error ? error.message : String(error), timing: timing() }, event.origin)
-  } finally { transfer?.close() }
+  } finally { transfer?.close(); outgoing?.close() }
 })

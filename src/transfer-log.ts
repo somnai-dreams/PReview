@@ -52,6 +52,6 @@ export function parseTransferLog(raw: unknown) {
     rejectionReasons: fields(input['rejectionReasons'] ?? {}, ['hook-kind-mismatch', 'incoming-value-invalid', 'live-ref-invalid', 'multiple-instances-after-commit'], true),
     rejectionPhases: fields(input['rejectionPhases'] ?? {}, ['validation', 'repair', 'verification'], true),
     sourceIndex: index(input['sourceIndex']), destinationIndex: index(input['destinationIndex']),
-    timing: { ...fields(timing, ['routeWaitMs', 'presentationMs', 'captureMs', 'comparisonMs', 'decodeMs', 'validationMs', 'firstCommitMs', 'secondCommitMs', 'verificationMs', 'restoreMs', 'validationAndScrollMs', 'encodeMs', 'decodeAndValidateMs', 'captureIndexMs', 'repairCheckMs', 'repairIndexMs', 'repairCommitMs']),
+    timing: { ...fields(timing, ['routeWaitMs', 'presentationMs', 'captureMs', 'comparisonMs', 'decodeMs', 'validationMs', 'firstCommitMs', 'secondCommitMs', 'verificationMs', 'restoreMs', 'validationAndScrollMs', 'encodeMs', 'decodeAndValidateMs', 'captureIndexMs', 'sendMs', 'repairCheckMs', 'repairIndexMs', 'repairCommitMs']),
       commands: commands(timing['commands']), routePreparation: commands(timing['routePreparation']) } }
 }

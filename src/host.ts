@@ -149,29 +149,23 @@ addEventListener('message', event => {
   clearTimeout(request.timer);
   request.finish(typeof message.error === 'string' ? Error(message.error) : null, message.result, message.timing);
 });
-function call(index, operation, snapshot, commands) {
+function call(index, operation, snapshot, commands, port) {
   const started = performance.now();
   return new Promise((resolve, reject) => {
     const id = ++sequence;
-    const transfer = snapshot instanceof Promise ? new MessageChannel() : null;
     const finish = (error, result, timing) => {
-      transfer?.port1.close();
       const roundTripMs = performance.now() - started;
       if (commands !== undefined) commands.push({ build: index, operation, roundTripMs, ...timing,
         transportAndQueueMs: timing === undefined ? undefined : Math.max(0, roundTripMs - Math.max(timing.sessionMs, timing.payloadWaitMs ?? 0) - timing.operationMs),
         error: error?.message });
       if (error !== null) reject(error); else resolve(result);
     };
-    const timer = setTimeout(() => { pending.delete(id); finish(Error(operation === 'ready' ? 'Application did not mount; check its login and backend connection' : 'Build did not respond to ' + operation)); }, operation === 'ready' ? 30000 : transfer === null ? 5000 : 10000);
+    const timer = setTimeout(() => { pending.delete(id); finish(Error(operation === 'ready' ? 'Application did not mount; check its login and backend connection' : 'Build did not respond to ' + operation)); }, operation === 'ready' ? 30000 : ['capture', 'checkpoint', 'restore'].includes(operation) ? 60000 : 5000);
     pending.set(id, { index, finish, timer });
     try {
-      frames[index].contentWindow.postMessage({ channel: 'preview-state', id, operation, snapshot: transfer === null ? snapshot : undefined }, origins[index], transfer === null ? [] : [transfer.port2]);
-      if (transfer !== null) void snapshot.then(
-        value => { if (pending.has(id)) transfer.port1.postMessage({ snapshot: value }); },
-        error => { if (pending.has(id)) transfer.port1.postMessage({ error: error instanceof Error ? error.message : String(error) }); }
-      ).catch(error => { if (pending.delete(id)) { clearTimeout(timer); finish(error); } });
+      frames[index].contentWindow.postMessage({ channel: 'preview-state', id, operation, snapshot }, origins[index], port === undefined ? [] : [port]);
     }
-    catch (error) { pending.delete(id); clearTimeout(timer); finish(error); }
+    catch (error) { port?.close(); pending.delete(id); clearTimeout(timer); finish(error); }
   });
 }
 async function swap(index) {
@@ -190,16 +184,18 @@ async function swap(index) {
     // total; its command timings explain the work that was already in flight.
     record.timing.routePreparation = preparation.commands;
     if (preparation.error !== null) throw preparation.error;
-    // Both frames authenticate concurrently. The destination receives its data
-    // through this request's private port as soon as capture completes.
-    const captured = call(active, 'capture', undefined, record.timing.commands);
-    const restored = call(index, 'restore', captured, record.timing.commands);
-    let result;
-    [snapshot, result] = await Promise.all([captured, restored]);
-    if (result.needsFull) {
-      snapshot = await call(active, 'checkpoint', undefined, record.timing.commands);
-      result = await call(index, 'restore', snapshot, record.timing.commands);
+    // The parent hands each endpoint directly to a build. Job data is cloned
+    // once between the builds and never enters the reviewer's JavaScript heap.
+    async function transfer(operation) {
+      const channel = new MessageChannel();
+      const restored = call(index, 'restore', undefined, record.timing.commands, channel.port2);
+      const captured = call(active, operation, undefined, record.timing.commands, channel.port1)
+        .then(metadata => { snapshot = metadata; return metadata; });
+      const [, result] = await Promise.all([captured, restored]);
+      return result;
     }
+    let result = await transfer('capture');
+    if (result.needsFull) result = await transfer('checkpoint');
     record.result = result;
     record.engine = snapshot.incremental?.enabled ? 'incremental' : 'full';
     if (result.rejected.length) {
