@@ -107,6 +107,13 @@ The optional incremental engine adds compiler write markers, native mutation obs
 
 PReview exchanges state directly between build frames and their parent via `postMessage`; it does not upload checkpoints to a server. `window.lastTransfer` contains the latest outcome and timing record, not a standalone snapshot. Checkpoint data remains in the frames' memory. Hosting application code is a separate deployment step owned by your launcher.
 
+**Copy details** copies the latest report, including a page-session ID and transfer sequence. Detailed JSON is generated when opened or copied. The reviewer does not serialize the full diagnostic report after every closed-panel switch.
+
+Hosted integrations can opt into timing logs through `reviewerResponse({ origin, builds, transferLog: { endpoint: '/api/transfers', buildIds: ['build-a', 'build-b'] } })`. The endpoint must share the reviewer's origin; provide one opaque ID per build. Logging is off by default. The caller owns endpoint authentication, request-size limits, storage and retention. Parse incoming JSON with `parseTransferLog` from `src/transfer-log.ts` before storing it; the parser reconstructs an allowlist of timings, numeric counts, index metrics, build IDs and session/sequence identifiers. It excludes application values, cell paths, routes, raw error messages and previous reports.
+
+Each completed, rejected or failed attempt schedules one small upload after presentation. It does not wait for the upload, queues no retries, and permits at most four requests in flight with ten-second timeouts. Return HTTP 204 after accepting the log. Transfer details shows **Timing saved** on acknowledgement or an explicit unsaved message on failure; copying remains available. Command round trips overlap, and index counters retain the lifetime semantics described above.
+
+
 ## Current limits
 
 - Supports `useState` and `useRef` values described by supported primitive, literal, union, array, fixed-tuple, Map, Set and plain-object types, including object intersections and mapped properties. `unknown` fields must pass the same plain-data checks at runtime; `any` remains unsupported. Type compatibility does not prove semantic compatibility across different code.

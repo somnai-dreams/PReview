@@ -1,10 +1,11 @@
 import { localURL, localPort } from './local'
 import { buildURL, deploymentOrigin } from './origin'
+import { parseTransferLog } from './transfer-log'
 
 type ReviewerOptions = { port: number; builds: { url: string; label: string }[]; tls?: { key: string; cert: string } }
 
 // The caller owns authentication and routing. Mount only after its access gate.
-export function reviewerResponse(options: { origin: string; builds: { url: string; label: string }[] }) {
+export function reviewerResponse(options: { origin: string; builds: { url: string; label: string }[]; transferLog?: { endpoint: string; buildIds: string[] } }) {
 const ownOrigin = deploymentOrigin(options.origin)
 const builds = options.builds.map(build => buildURL(build.url))
 const origins = builds.map(url => url.origin)
@@ -12,6 +13,13 @@ if (origins.length < 2 || origins.length > 4 || new Set(origins).size !== origin
   throw new Error('Provide two to four distinct build origins, separate from the reviewer')
 }
 if (ownOrigin.startsWith('https:') && builds.some(url => url.protocol !== 'https:')) throw new Error('An HTTPS reviewer needs HTTPS builds')
+
+const logging = options.transferLog
+if (logging !== undefined) {
+  const endpoint = new URL(logging.endpoint, ownOrigin)
+  if (endpoint.origin !== ownOrigin || endpoint.username !== '' || endpoint.password !== '' || endpoint.search !== '' || endpoint.hash !== '') throw new Error('Transfer logs require a same-origin endpoint without query parameters')
+  if (logging.buildIds.length !== builds.length || new Set(logging.buildIds).size !== builds.length || logging.buildIds.some(id => !/^[a-zA-Z0-9._-]{1,80}$/.test(id))) throw new Error('Provide one distinct opaque log ID per build')
+}
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PReview</title><style>
 *{box-sizing:border-box}body{margin:0;font:14px system-ui;background:#161719;color:#eee}
@@ -21,8 +29,8 @@ button:disabled{opacity:.5;cursor:wait}header strong{flex-shrink:0}
 button[aria-pressed=true]{background:#eef;color:#112}
 iframe{position:absolute;top:58px;left:0;width:100%;height:calc(100vh - 58px);border:0;visibility:hidden}
 iframe.active{visibility:visible}#status{font-size:12px}
-details{position:absolute;z-index:2;right:12px;top:66px;background:#292b30;border:1px solid #777;border-radius:7px;padding:8px;max-width:min(620px,90vw)}summary{cursor:pointer}pre{max-height:65vh;overflow:auto;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
-</style></head><body><header><strong>PReview</strong><span id="status" role="status">Connecting to builds…</span></header><details id="details" hidden><summary>Transfer details</summary><pre id="report"></pre></details>
+details{position:absolute;z-index:2;right:12px;top:66px;background:#292b30;border:1px solid #777;border-radius:7px;padding:8px;max-width:min(620px,90vw)}summary{cursor:pointer}#detail-actions{display:flex;align-items:center;gap:10px;margin-top:10px;font-size:12px}pre{max-height:65vh;overflow:auto;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+</style></head><body><header><strong>PReview</strong><span id="status" role="status">Connecting to builds…</span></header><details id="details" hidden><summary>Transfer details</summary><div id="detail-actions"><button id="copy-details" type="button">Copy details</button><span id="copy-status" role="status"></span><span id="log-status" role="status"></span></div><pre id="report"></pre></details>
 <script type="module">
 const origins = ${JSON.stringify(origins)};
 const urls = ${JSON.stringify(builds.map(url => url.href)).replaceAll('<', '\\u003c')};
@@ -32,6 +40,45 @@ const frames = [], buttons = [], capabilities = [];
 const reload = document.createElement('button'); reload.textContent = 'Reload builds';
 reload.addEventListener('click', () => { if (!busy) location.reload(); }); header.insertBefore(reload, status);
 const benchmarkRecords = [];
+const logConfig = ${JSON.stringify(logging === undefined ? null : { endpoint: new URL(logging.endpoint, ownOrigin).pathname, buildIds: logging.buildIds })};
+const parseTransferLog = ${parseTransferLog.toString()};
+const session = crypto.randomUUID();
+const details = document.querySelector('#details'), report = document.querySelector('#report');
+const copyButton = document.querySelector('#copy-details'), copyStatus = document.querySelector('#copy-status'), logStatus = document.querySelector('#log-status');
+let latestReport = null, transferSequence = 0, loggingRequests = 0;
+function renderReport() { if (latestReport !== null) report.textContent = JSON.stringify(latestReport, null, 2); }
+details.addEventListener('toggle', () => { if (details.open) renderReport(); });
+copyButton.addEventListener('click', async () => {
+  if (latestReport === null) return;
+  try { await navigator.clipboard.writeText(JSON.stringify(latestReport, null, 2)); copyStatus.textContent = 'Copied'; }
+  catch { copyStatus.textContent = 'Copy unavailable; select the details below'; renderReport(); }
+});
+function logTransfer(report, source, destination) {
+  if (logConfig === null) return;
+  const status = text => { if (latestReport === report) logStatus.textContent = text; };
+  if (loggingRequests >= 4) { status('Timing not saved: logger busy'); return; }
+  loggingRequests++;
+  // Run after presentation; no snapshots, cell identities, raw errors or history
+  // enter this bounded request. Failed uploads never delay or retry a switch.
+  setTimeout(async () => {
+    try {
+      const command = item => ({ ...item, failed: item.error !== undefined });
+      const payload = parseTransferLog({ version: 1, session, sequence: report.transfer.sequence, builds: logConfig.buildIds,
+        source, destination, engine: report.engine, outcome: report.outcome, milliseconds: report.milliseconds,
+        counts: { restored: report.restored?.length, absent: report.absent?.length, rejected: report.rejected?.length,
+          secondPass: report.secondPass?.length, changed: report.changed?.length, retained: report.retained, transferred: report.transferred,
+          sourceSkipped: report.keptLocal.source?.length, destinationSkipped: report.keptLocal.destination?.length },
+        sourceIndex: report.sourceIndex ?? null, destinationIndex: report.destinationIndex ?? null,
+        timing: { ...report.timing, ...report.timing.capture, ...report.timing.restore,
+          commands: report.timing.commands.map(command), routePreparation: (report.timing.routePreparation ?? []).map(command) } });
+      const response = await fetch(logConfig.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload), keepalive: true, signal: AbortSignal.timeout(10000) });
+      if (response.status !== 204) throw Error('Timing upload failed');
+      status('Timing saved');
+    } catch { status('Timing not saved; use Copy details'); }
+    finally { loggingRequests--; }
+  }, 0);
+}
 const engine = document.createElement('select'); engine.setAttribute('aria-label', 'Comparison engine');
 engine.innerHTML = '<option value="incremental">Incremental</option><option value="full">Full checks</option>'; engine.hidden = true; header.insertBefore(engine, status);
 engine.addEventListener('change', async () => {
@@ -173,14 +220,17 @@ async function swap(index) {
       milliseconds: record.milliseconds, rejected: result?.rejected.length, changed: result?.changed?.length, error: record.error });
     if (benchmarkRecords.length > 100) benchmarkRecords.shift();
     window.lastTransfer = record;
-    document.querySelector('#details').hidden = false;
-    document.querySelector('#report').textContent = JSON.stringify({ milliseconds: record.milliseconds, engine: record.engine, outcome: record.outcome, error: record.error,
+    latestReport = { transfer: { session, sequence: ++transferSequence }, milliseconds: record.milliseconds, engine: record.engine, outcome: record.outcome, error: record.error,
       sourceIndex: snapshot?.incremental, destinationIndex: result?.incremental,
       indexStatistics: 'Current: indexedObjects, roots, pending, enabled, coverage. Other index counters and timings accumulate for the lifetime of each build.',
       restored: result?.restored, absent: result?.absent, rejected: result?.rejected, rejectionDetails: result?.rejectionDetails,
       secondPass: result?.secondPass, changed: result?.changed, retained: result?.retained, transferred: result?.transferred,
       keptLocal: { source: snapshot?.skipped, destination: result?.skipped },
-      timing: { ...record.timing, capture: { captureMs: snapshot?.captureMs, comparisonMs: snapshot?.comparisonMs }, restore: result?.timing }, recent: benchmarkRecords }, null, 2);
+      timing: { ...record.timing, capture: { captureMs: snapshot?.captureMs, comparisonMs: snapshot?.comparisonMs }, restore: result?.timing }, recent: benchmarkRecords.slice() };
+    details.hidden = false; copyStatus.textContent = '';
+    logStatus.textContent = logConfig === null ? '' : 'Saving timing…';
+    if (details.open) renderReport(); else report.textContent = '';
+    logTransfer(latestReport, record.source, record.destination);
     if (record.outcome === 'restored') status.textContent = result.restored.length + ' cells · ' + result.absent.length + ' absent · '
       + (result.skipped.length ? result.skipped.length + ' kept local · ' : '')
       + (result.changed.length ? result.changed.length + ' changed during restore · ' : '')
@@ -199,7 +249,7 @@ return (request: Request) => {
   return new Response(html, { headers: {
     'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
     'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff',
-    'content-security-policy': "default-src 'none'; script-src 'sha256-" + hash + "'; style-src 'unsafe-inline'; frame-src " + origins.join(' ') + "; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    'content-security-policy': "default-src 'none'; script-src 'sha256-" + hash + "'; " + (logging === undefined ? '' : "connect-src 'self'; ") + "style-src 'unsafe-inline'; frame-src " + origins.join(' ') + "; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
   } })
 }
 }
