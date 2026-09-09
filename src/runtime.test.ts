@@ -84,6 +84,40 @@ test('repair retains aliases to refs that do not need a second write', () => {
   expect(report.changed).toEqual([])
 })
 
+test('repair reuses a verified alias without rewriting it and still detects later effect mutations', () => {
+  for (const mutate of [false, true]) {
+    let writes = 0, repairWrites = -1
+    const row = new Proxy({ title: 'old' }, { defineProperty(target, key, descriptor) {
+      writes++
+      return Reflect.defineProperty(target, key, descriptor)
+    } })
+    const feed = cell('feed', 'ref', [row]), selected = cell('selected', 'ref', null)
+    const cache = incrementalCache()
+    const { runtime } = harness(pass => {
+      if (pass === 1) {
+        writes = 0
+        selected.reset({ rows: feed.cell.read(), label: 'derived' })
+      } else {
+        repairWrites = writes
+        if (mutate) cache.touch(row, 'property', 'title').title = 'effect edit'
+      }
+    }, false, cache)
+    runtime.register(feed.cell); runtime.register(selected.cell)
+    const rows = [{ title: 'saved' }]
+    const report = runtime.restore({ id: crypto.randomUUID(), base: null, history: journal, scroll: [], values: [
+      { id: 'feed', kind: 'ref', value: rows },
+      { id: 'selected', kind: 'ref', value: { rows, label: 'chosen' } },
+    ] })
+    expect(report.secondPass).toEqual(['selected'])
+    expect(repairWrites).toBe(0)
+    expect((selected.cell.read() as { rows: Value }).rows).toBe(feed.cell.read())
+    expect((feed.cell.read() as Value[])[0]).toBe(row)
+    expect(row.title).toBe(mutate ? 'effect edit' : 'saved')
+    expect(report.changed).toEqual(mutate ? ['feed', 'selected'] : [])
+    expect(report.rejected).toEqual([])
+  }
+})
+
 test('a settled restoration needs one commit and an incompatible value needs none', () => {
   const draft = cell('draft', 'state', '')
   const { runtime, counts } = harness()

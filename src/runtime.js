@@ -242,7 +242,7 @@ function restore(packet) {
   nativeReplace(target.state, '', target.path)
   // Mount/reset effects can introduce owners or change restored values. Repair
   // only those cells, preserving the graph identities established above.
-  const repairs = [], repairComparison = comparison(pending.context.copies, incremental?.phase())
+  const repairs = [], settled = [], repairComparison = comparison(pending.context.copies, incremental?.phase())
   for (const saved of transferable) {
     const instances = cells.get(saved.id)
     if (instances === undefined) continue
@@ -254,6 +254,7 @@ function restore(packet) {
     const known = retained.has(saved.id) && checkpoint.owners.get(saved.id) === cell || plan.some(entry => entry.saved === saved && entry.cell === cell)
     if (!known && !validation.accepts(cell.schema, saved.value)) { rejections.push({ id: saved.id, reason: 'incoming-value-invalid', phase: 'repair' }); continue }
     if (repairComparison.matches(saved.value, cell.read())) {
+      settled.push({ source: saved.value, target: cell.read() })
       if (!restored.includes(saved.id)) restored.push(saved.id)
       continue
     }
@@ -263,7 +264,13 @@ function restore(packet) {
   const secondPass = repairs.map(entry => entry.saved.id)
   const repaired = rejections.length === 0 && repairs.length > 0
   if (repaired) {
+    // These roots were just checked. Keep their proofs across the repair commit
+    // so observed effect writes invalidate only the graphs they actually touch.
+    incremental?.keep(settled)
     pending.context.pass++
+    // Repair can alias a large, already settled ref. Reuse its verified objects
+    // rather than rewriting them because the outer ref needs another commit.
+    pending.context.settled = repairComparison.pairs
     flushSync(() => applyValues(repairs))
     for (const { saved } of repairs) if (!restored.includes(saved.id)) restored.push(saved.id)
   }

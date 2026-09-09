@@ -218,7 +218,7 @@ export function checkpointValidation() {
   return { accepts: acceptsCopy, remember }
 }
 
-export type Restoration = { copies: Copies; claimed: { has: (value: object) => boolean; add: (value: object) => void }; pass: number }
+export type Restoration = { copies: Copies; claimed: { has: (value: object) => boolean; add: (value: object) => void }; pass: number; settled: Pick<PairMap, 'get'> | undefined }
 export function restoration(matches: Pick<PairMap, 'get'> = new Map(), reverse: Pick<PairMap, 'has'> = new Map()): Restoration {
   const changed: Copies['changed'] = new Map(), claimed = new Set<object>()
   const copies: Copies = {
@@ -231,7 +231,7 @@ export function restoration(matches: Pick<PairMap, 'get'> = new Map(), reverse: 
     },
     set(source, copy) { changed.set(source, copy) },
   }
-  return { copies, claimed: { has: value => claimed.has(value) || reverse.has(value), add: value => { claimed.add(value) } }, pass: 0 }
+  return { copies, claimed: { has: value => claimed.has(value) || reverse.has(value), add: value => { claimed.add(value) } }, pass: 0, settled: undefined }
 }
 
 export function matchesRestoration(source: Value, current: unknown, context: Restoration): boolean {
@@ -243,7 +243,7 @@ export function matchesRestoration(source: Value, current: unknown, context: Res
 export function reconcile(source: Value, destination: unknown, context: Restoration): Value {
   if (source === null || typeof source !== 'object') return source
   const previousCopy = context.copies.get(source)
-  if (previousCopy !== undefined && previousCopy.pass === context.pass) return previousCopy.value
+  if (previousCopy !== undefined && (previousCopy.pass === context.pass || context.settled?.get(source) === previousCopy.value)) return previousCopy.value
   const available = destination !== null && typeof destination === 'object' && !context.claimed.has(destination) && !Object.isFrozen(destination)
   let target: Container
   if (previousCopy !== undefined) target = previousCopy.value
