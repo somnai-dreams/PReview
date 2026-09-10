@@ -1,7 +1,8 @@
 import { useState, useLayoutEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
-import { accepts, equal, comparison, checkpointValidation, reconcile, restoration } from './values'
-import { retainedCells, encodeValues, decodeValues } from './checkpoint'
+import { accepts, equal } from './values'
+import { runtimeState } from './transfer/runtime-state'
+import { commitCells } from './transfer/cell-commit'
 
 // Replaced by the external bundler for this comparison host.
 const reviewerOrigin = '__PREVIEW_ORIGIN__'
@@ -20,15 +21,13 @@ function requireSession(saved) {
   if (session === null ? saved !== null : saved === null || saved?.account !== session.account || saved?.environment !== session.environment) throw new Error('Build accounts or environments do not match')
 }
 const cells = new Map()
-const validation = checkpointValidation()
-const incremental = globalThis.__previewIncremental ?? null
+const bridge = globalThis.__previewTransfer ?? runtimeState()
 let markMounted
 const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
-let checkpoint = null
-// A rejected payload is still a received wire baseline. Keep at most one so a
-// retry can decode its delta without claiming any application state was applied.
-let rejectedCheckpoint = null
+let revision = 0
+export function renderRevision() { return revision }
+export function valueVersion(value) { return bridge.version(value) }
 let interacted = false
 for (const type of ['pointerdown','keydown','input']) addEventListener(type,event=>{if(event.isTrusted)interacted=true},{capture:true})
 function publishNavigation() {
@@ -71,6 +70,7 @@ history.go = (delta = 0) => {
 history.back = () => history.go(-1)
 history.forward = () => history.go(1)
 
+
 function observe(cell) {
   useLayoutEffect(() => {
     let instances = cells.get(cell.id)
@@ -78,74 +78,54 @@ function observe(cell) {
     instances.push(cell)
     markMounted()
     return () => {
-      const index = instances.indexOf(cell)
-      if (index !== -1) instances.splice(index, 1)
+      instances.splice(instances.indexOf(cell), 1)
       if (instances.length === 0) cells.delete(cell.id)
     }
   }, [])
 }
-
+function validPending(schema, value) {
+  const phase = bridge.connection().graph.begin()
+  try { const valid = phase.accepts(schema, value); if (valid) phase.commit(); else phase.abort(); return valid }
+  finally { phase.close() }
+}
 export function useObservedState(id, schema, initial) {
   const [value, setter] = useState(() => {
-    const saved = pending?.values.find(cell => cell.id === id && cell.kind === 'state')
-    if (saved !== undefined && validation.accepts(schema, saved.value)) return reconcile(saved.value, undefined, pending.context)
+    const saved = pending?.find(cell => cell.id === id && cell.kind === 'state')
+    if (saved !== undefined && validPending(schema, saved.value)) return saved.value
     return typeof initial === 'function' ? initial() : initial
   })
   const [, refresh] = useState(0)
-  const token = useRef({ id, schema, kind: 'state', value,
+  const rendered = { value, version: bridge.version(value) }
+  const token = useRef({ id, schema, kind: 'state', value, rendered,
     read() { return this.value },
+    stale() { return !Object.is(this.rendered.value, this.value) || this.rendered.version !== bridge.version(this.value) },
     write(next) { setter(() => next); refresh(value => value + 1) },
   })
-  useLayoutEffect(() => { token.current.value = value })
+  useLayoutEffect(() => { token.current.value = value; token.current.rendered = rendered })
   observe(token.current)
   return [value, setter]
 }
-
 export function useObservedRef(id, schema, initial) {
-  const ref = useRef(initial)
+  const ref = useRef(initial), mounted = useRef(false)
   const [, refresh] = useState(0)
-  const mounted = useRef(false)
   if (!mounted.current && pending !== null) {
-    const saved = pending.values.find(cell => cell.id === id && cell.kind === 'ref')
-    if (saved !== undefined && validation.accepts(schema, saved.value) && accepts(schema, ref.current)) ref.current = reconcile(saved.value, ref.current, pending.context)
+    const saved = pending.find(cell => cell.id === id && cell.kind === 'ref')
+    if (saved !== undefined && validPending(schema, saved.value) && accepts(schema, ref.current)) ref.current = saved.value
   }
   useLayoutEffect(() => { mounted.current = true }, [])
-  const token = useRef({ id, schema, kind: 'ref',
+  const rendered = { value: ref.current, version: bridge.version(ref.current) }
+  const token = useRef({ id, schema, kind: 'ref', rendered,
     read: () => ref.current,
+    stale() { return !Object.is(this.rendered.value, ref.current) || this.rendered.version !== bridge.version(ref.current) },
     write(next) { ref.current = next; refresh(value => value + 1) },
   })
+  useLayoutEffect(() => { token.current.rendered = rendered })
   observe(token.current)
   return ref
 }
-
-function capture() {
-  const started = performance.now()
-  const values = [], skipped = []
-  const candidates = []
-  for (const [id, instances] of cells) {
-    if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
-  }
-  const previous = checkpoint === null ? [] : checkpoint.snapshot.values.map(saved => ({ ...saved, owner: checkpoint.owners.get(saved.id) }))
-  const captureReuse = incremental?.phase()
-  const { retained, reverse } = checkpoint === null ? { retained: new Set(), reverse: new Map() } : retainedCells(previous, candidates, captureReuse)
-  const comparisonMs = performance.now() - started
-  const construction = incremental?.begin()
-  const captureCopy = validation.capturePhase(reverse, construction)
-  try {
-  const priorValues = new Map(previous.map(saved => [saved.id, saved]))
-  const owners = new Map()
-  for (const [id, instances] of cells) {
-    if (instances.length !== 1) { skipped.push({ id, reason: 'multiple instances', count: instances.length }); continue }
-    const cell = instances[0]
-    const value = cell.read()
-    if (!retained.has(id) && !captureCopy.accepts(cell.schema, value)) {
-      const root = cell.schema.nodes[cell.schema.root]
-      skipped.push({ id, reason: root.kind === 'reject' ? root.reason : 'unsupported value or type' })
-      continue
-    }
-    values.push({ id, kind: cell.kind, value: retained.has(id) ? priorValues.get(id).value : captureCopy.value(value) })
-    owners.set(id, cell)
-  }
+function mountedCells() { return [...cells.values()].flat() }
+function view() { return mountedCells().map(cell => ({ id: cell.id, kind: cell.kind, schema: cell.schema, value: cell.read(), owner: cell })) }
+function captureContext() {
   const scroll = []
   const elements = [...document.querySelectorAll('[id]')]
   for (const element of elements) {
@@ -163,152 +143,29 @@ function capture() {
     }
     scroll.push({ id: element.id, top: element.scrollTop, left: element.scrollLeft, anchor })
   }
-  // Copy changed data and reconnect its references to the retained checkpoint.
-  const changedValues = values.filter(saved => !retained.has(saved.id))
-  const baseObjects = checkpoint?.snapshot.values.map(saved => saved.value) ?? []
-  const encodingAt = performance.now()
-  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, { get: source => captureCopy.reused(source) ? source : undefined }, construction?.previous, true, incremental?.ancestors)
-  const encodedAt = performance.now()
-  const snapshot = structuredClone({ skipped, scroll, history: navigation, session })
-  snapshot.values = changedValues
-  const changed = new Map(snapshot.values.map(saved => [saved.id, saved]))
-  const encodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: encoded.values[index] }]))
-  const entries = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, reuse: true } : encodedById.get(saved.id))
-  snapshot.values = values.map(saved => retained.has(saved.id) ? { id: saved.id, kind: saved.kind, value: priorValues.get(saved.id).value } : changed.get(saved.id))
-  const indexingAt = performance.now()
-  construction?.commit(snapshot.values.map(saved => ({ source: saved.value, target: owners.get(saved.id).read() })))
-  snapshot.captureMs = performance.now() - started
-  snapshot.comparisonMs = comparisonMs
-  snapshot.captureDetails = { validationAndScrollMs: encodingAt - started - comparisonMs, encodeMs: encodedAt - encodingAt, decodeAndValidateMs: indexingAt - encodedAt, captureIndexMs: performance.now() - indexingAt, heapBytes: performance.memory?.usedJSHeapSize, copiedObjects: captureCopy.count(), patchedObjects: encoded.patchedObjects, reusedObjects: encoded.reusedObjects }
-  snapshot.incremental = incremental?.stats()
-  const base = checkpoint?.id ?? null, id = crypto.randomUUID()
-  checkpoint = { id, snapshot, owners }
-  rejectedCheckpoint = null
-  return { ...snapshot, values: entries, references: encoded.references, base, id }
-  } finally { construction?.close() }
+  return { scroll, history: navigation, session }
 }
-
-function restore(packet) {
-  const started = performance.now()
-  if (typeof packet.id !== 'string' || !(packet.base === null || typeof packet.base === 'string')) throw new Error('Invalid checkpoint identity')
-  if (packet.base === null && (packet.values.some(saved => saved.reuse === true) || packet.references?.length)) throw new Error('A full checkpoint cannot contain references')
-  const baseCheckpoint = checkpoint?.id === packet.base ? checkpoint : rejectedCheckpoint?.id === packet.base ? rejectedCheckpoint : null
-  if (packet.base !== null && baseCheckpoint === null) return { needsFull: true }
-  const changedValues = packet.values.filter(saved => saved.reuse !== true)
-  const decoded = decodeValues(changedValues.map(saved => saved.value), packet.references ?? [], baseCheckpoint?.snapshot.values.map(saved => saved.value) ?? [])
-  const decodedById = new Map(changedValues.map((saved, index) => [saved.id, { ...saved, value: decoded[index] }]))
-  const old = new Map(baseCheckpoint?.snapshot.values.map(saved => [saved.id, saved]) ?? [])
-  const reused = new Set()
-  const values = packet.values.map(saved => {
-    if (saved.reuse !== true) return decodedById.get(saved.id)
-    const previous = old.get(saved.id)
-    if (previous === undefined || previous.kind !== saved.kind) throw new Error('Invalid checkpoint reference')
-    reused.add(saved.id)
-    return previous
-  })
-  const snapshot = { values, scroll: packet.scroll, history: packet.history }
-  const decodedAt = performance.now()
-  const candidates = []
-  for (const [id, instances] of cells) {
-    if (instances.length === 1) candidates.push({ id, kind: instances[0].kind, value: instances[0].read(), owner: instances[0] })
+function historyBoundary(journal) {
+  if (journal === null || typeof journal !== 'object' || !Array.isArray(journal.entries) || journal.entries.length === 0 || !Number.isSafeInteger(journal.index) || journal.index < 0 || journal.index >= journal.entries.length) throw Error('Invalid navigation history')
+  for (const entry of journal.entries) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.path !== 'string' || new URL(entry.path, location.href).origin !== location.origin) throw Error('Invalid navigation path')
   }
-  const reuse = incremental?.phase()
-  const { retained, matches, reverse } = reused.size === 0 ? { retained: new Set(), matches: new Map(), reverse: new Map() } : retainedCells(
-    values.map(saved => ({ ...saved, owner: reused.has(saved.id) ? baseCheckpoint.owners.get(saved.id) : saved })), candidates, reuse)
-  const restored = [], rejections = [], skipped = [], absent = [], plan = []
-  for (const saved of snapshot.values) {
-    const instances = cells.get(saved.id)
-    if (instances === undefined) { absent.push(saved.id); continue }
-    if (instances.length !== 1) { skipped.push({ id: saved.id, reason: 'multiple instances', count: instances.length }); continue }
-    if (retained.has(saved.id)) { restored.push(saved.id); continue }
-    const current = instances[0].read(), matched = reverse.get(current)
-    const validatedBefore = reused.has(saved.id) && baseCheckpoint.owners.get(saved.id) === instances[0]
-    const reason = instances[0].kind !== saved.kind ? 'hook-kind-mismatch'
-      : !validatedBefore && !validation.accepts(instances[0].schema, saved.value) ? 'incoming-value-invalid'
-      : saved.kind === 'ref' && !(matched === undefined ? validation.acceptsLive(instances[0].schema, current, { get: value => reverse.get(value) ?? reuse?.reuseTarget(value) }) : validation.accepts(instances[0].schema, matched)) ? 'live-ref-invalid' : null
-    if (reason !== null) { rejections.push({ id: saved.id, reason, phase: 'validation' }); continue }
-    plan.push({ saved, cell: instances[0] })
-    restored.push(saved.id)
+  return journal
+}
+function contextBoundary(context) {
+  if (context === null || typeof context !== 'object') throw Error('Missing transfer context')
+  requireSession(context.session)
+  historyBoundary(context.history)
+  if (!Array.isArray(context.scroll)) throw Error('Invalid scroll positions')
+  const ids = new Set()
+  for (const entry of context.scroll) {
+    if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string' || ids.has(entry.id) || !Number.isFinite(entry.top) || !Number.isFinite(entry.left)) throw Error('Invalid scroll position')
+    ids.add(entry.id)
+    if (entry.anchor !== null && (typeof entry.anchor !== 'object' || typeof entry.anchor.path !== 'string' || !Number.isFinite(entry.anchor.offset) || new URL(entry.anchor.path, location.href).origin !== location.origin)) throw Error('Invalid scroll anchor')
   }
-  const validated = performance.now()
-  if (rejections.length > 0) {
-    rejectedCheckpoint = { id: packet.id, snapshot, owners: new Map() }
-    return { restored: [], rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent, incremental: incremental?.stats(),
-    timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: 0, secondCommitMs: 0, verificationMs: 0, restoreMs: performance.now() - started } }
-  }
-  // Ambiguous owners stay local for this entire transfer, including remounts.
-  const transferable = snapshot.values.filter(saved => !skipped.some(item => item.id === saved.id))
-  const construction = incremental?.begin()
-  for (const saved of transferable) if (retained.has(saved.id)) construction?.adopt(saved.value, cells.get(saved.id)[0].read())
-  pending = { values: transferable, context: restoration(matches, { has: value => reverse.get(value) !== undefined }, reuse, construction) }
-  function applyValues(entries) {
-    // Validation precedes this synchronous commit. Refs establish canonical
-    // container identities before state that may point into the same graph.
-    for (const kind of ['ref', 'state']) {
-      for (const { saved, cell } of entries) {
-        if (saved.kind !== kind) continue
-        cell.write(reconcile(saved.value, kind === 'ref' ? cell.read() : undefined, pending.context))
-      }
-    }
-  }
-  try {
-  if (plan.length > 0) flushSync(() => applyValues(plan))
-  const firstCommit = performance.now()
-  navigation = structuredClone(snapshot.history)
-  const target = navigation.entries[navigation.index]
-  nativeReplace(target.state, '', target.path)
-  // Mount/reset effects can introduce owners or change restored values. Repair
-  // only those cells, preserving the graph identities established above.
-  const repairReuse = incremental?.phase()
-  const repairs = [], settled = [], repairComparison = comparison(pending.context.copies, repairReuse)
-  for (const saved of transferable) {
-    const instances = cells.get(saved.id)
-    if (instances === undefined) continue
-    // A commit may already have initialized new owners: do not claim these
-    // stayed local, or silently accept an ownership change after applying state.
-    if (instances.length !== 1) { rejections.push({ id: saved.id, reason: 'multiple-instances-after-commit', count: instances.length, phase: 'repair' }); continue }
-    if (instances[0].kind !== saved.kind) { rejections.push({ id: saved.id, reason: 'hook-kind-mismatch', phase: 'repair' }); continue }
-    const cell = instances[0]
-    const known = retained.has(saved.id) && baseCheckpoint.owners.get(saved.id) === cell || plan.some(entry => entry.saved === saved && entry.cell === cell)
-    if (!known && !validation.accepts(cell.schema, saved.value)) { rejections.push({ id: saved.id, reason: 'incoming-value-invalid', phase: 'repair' }); continue }
-    if (repairComparison.matches(saved.value, cell.read())) {
-      settled.push({ source: saved.value, target: cell.read() })
-      if (!restored.includes(saved.id)) restored.push(saved.id)
-      continue
-    }
-    if (saved.kind === 'ref' && !validation.acceptsLive(cell.schema, cell.read(), { get: value => repairComparison.reverse.get(value) ?? repairReuse?.reuseTarget(value) })) { rejections.push({ id: saved.id, reason: 'live-ref-invalid', phase: 'repair' }); continue }
-    repairs.push({ saved, cell })
-  }
-  const secondPass = repairs.map(entry => entry.saved.id)
-  const repairCheckedAt = performance.now()
-  let repairIndexedAt = repairCheckedAt
-  const repaired = rejections.length === 0 && repairs.length > 0
-  if (repaired) {
-    // These roots were just checked. Keep their proofs across the repair commit
-    // so observed effect writes invalidate only the graphs they actually touch.
-    if (construction === undefined) incremental?.keep(settled)
-    else for (const pair of settled) construction.adopt(pair.source, pair.target)
-    repairIndexedAt = performance.now()
-    pending.context.pass++
-    // Repair can alias a large, already settled ref. Reuse its verified objects
-    // rather than rewriting them because the outer ref needs another commit.
-    pending.context.settled = repairComparison.pairs
-    flushSync(() => applyValues(repairs))
-    for (const { saved } of repairs) if (!restored.includes(saved.id)) restored.push(saved.id)
-  }
-  const secondCommit = performance.now()
-  // A commit can change any live cell. Without one, this is still the same
-  // synchronous read phase: reuse its comparisons before touching scroll.
-  const changed = [], verification = repaired ? comparison(pending.context.copies, incremental?.phase()) : repairComparison
-  for (const saved of transferable) {
-    const instances = cells.get(saved.id)
-    if (instances === undefined) continue
-    if (instances.length !== 1) {
-      if (!rejections.some(item => item.id === saved.id)) rejections.push({ id: saved.id, reason: 'multiple-instances-after-commit', count: instances.length, phase: 'verification' })
-      continue
-    }
-    if (!verification.matches(saved.value, instances[0].read())) changed.push(saved.id)
-  }
+  return context
+}
+function restoreScroll(snapshot) {
   const scrollRestored = []
   for (const saved of snapshot.scroll) {
     const element = document.getElementById(saved.id)
@@ -327,112 +184,155 @@ function restore(packet) {
     element.scrollTo(saved.left, top)
     scrollRestored.push({id:saved.id,method})
   }
-  if (rejections.length === 0) {
-    checkpoint = { id: packet.id, snapshot, owners: new Map(restored.map(id => [id, cells.get(id)?.[0]])) }
-    rejectedCheckpoint = null
-  } else rejectedCheckpoint = { id: packet.id, snapshot, owners: new Map() }
-  if (rejections.length === 0) {
-    const pairs = snapshot.values.flatMap(saved => { const instances = cells.get(saved.id); return instances?.length === 1 && restored.includes(saved.id) && !changed.includes(saved.id) ? [{source:saved.value,target:instances[0].read()}] : [] })
-    if (construction === undefined) incremental?.keep(pairs)
-    else construction.commit(pairs)
+  return scrollRestored
+}
+function applyPacket(packet, snapshot) {
+  if (!Array.isArray(packet?.names) || packet.names.length > 2000) throw Error('Invalid named cells')
+  const { graph, session: transfer, writer } = bridge.connection()
+  const started = performance.now()
+  const restored = transfer.receive(packet, view(), bridge.observed(), writer, values => commitCells(graph, values, {
+    cells: mountedCells, commit(write) { revision++; flushSync(write) }, pending(values) { pending = values }, observed: bridge.observed,
+    afterFirstCommit() {
+      navigation = snapshot.history
+      const target = navigation.entries[navigation.index]
+      nativeReplace(target.state, '', target.path)
+    },
+  }, writer))
+  const application = restored.application
+  const accepted = restored.receipt.outcome === 'accepted'
+  return { receipt: restored.receipt, report: {
+    retry: restored.retry === 'full' || restored.receipt.outcome === 'retry',
+    restored: application?.restored ?? [], absent: application?.absent ?? restored.absent ?? [],
+    rejected: accepted ? [] : application?.issues.length ? application.issues.map(issue => issue.id) : ['transfer'],
+    rejectionDetails: application?.issues ?? [], error: restored.error,
+    secondPass: application?.secondPass ?? [], changed: application?.changed ?? [], skipped: [],
+    retained: restored.values?.filter(value => !value.changed).length ?? 0,
+    transferred: restored.values?.filter(value => value.changed).length ?? 0,
+    repairMode: application?.repairMode, journalObjects: application?.journalObjects, snapshotObjects: application?.snapshotObjects,
+    scrollRestored: accepted ? restoreScroll(snapshot) : [], incremental: bridge.stats(),
+    timing: { restoreMs: performance.now() - started },
+  } }
+}
+
+// One bounded inbox for the offer -> packet -> receipt exchange. It is installed
+// before authentication, and owns the port and timeout for exactly one command.
+function peerChannel(port) {
+  let waiting = null, queued = null, failure = null, closed = false
+  function fail(error) { failure = error; if (waiting !== null) { waiting.reject(error); waiting = null } }
+  const timer = setTimeout(() => fail(Error('Build transfer timed out')), 60000)
+  port.onmessage = event => {
+    const value = event.data
+    if (value === null || typeof value !== 'object') { fail(Error('Invalid transfer message')); return }
+    if (typeof value.error === 'string') { fail(Error(value.error)); return }
+    if (waiting !== null) { const resolve = waiting.resolve; waiting = null; resolve(value) }
+    else if (queued === null) queued = value
+    else fail(Error('Unexpected transfer message'))
   }
-  return { incremental: incremental?.stats(), restored, rejected: rejections.map(item => item.id), rejectionDetails: rejections, skipped, absent: absent.filter(id => !restored.includes(id)), secondPass, changed, scrollRestored, retained: retained.size, transferred: values.length - reused.size,
-    timing: { decodeMs: decodedAt - started, validationMs: validated - decodedAt, firstCommitMs: firstCommit - validated, secondCommitMs: secondCommit - firstCommit, repairCheckMs: repairCheckedAt - firstCommit, repairIndexMs: repairIndexedAt - repairCheckedAt, repairCommitMs: secondCommit - repairIndexedAt, verificationMs: performance.now() - secondCommit, restoreMs: performance.now() - started } }
-  } finally { pending = null; construction?.close() }
+  port.onmessageerror = () => fail(Error('Invalid transfer message'))
+  port.start()
+  return {
+    read() {
+      if (failure !== null) return Promise.reject(failure)
+      if (closed || waiting !== null) return Promise.reject(Error('Invalid transfer phase'))
+      if (queued !== null) { const value = queued; queued = null; return Promise.resolve(value) }
+      return new Promise((resolve, reject) => { waiting = { resolve, reject } })
+    },
+    post(value) { if (failure !== null) throw failure; if (closed) throw Error('Transfer is closed'); port.postMessage(value) },
+    error(message) { if (!closed) port.postMessage({ error: message }) },
+    close() { closed = true; clearTimeout(timer); port.onmessage = null; port.onmessageerror = null; port.close(); queued = null; fail(Error('Transfer closed')) },
+  }
 }
-
-globalThis.__preview = { capture, restore }
-
-// A restore request can arrive before its payload so session verification and
-// source capture overlap. The port belongs only to this authenticated parent
-// request and is closed on every completion, failure, or payload timeout.
-function receiveTransfer(port) {
-  let timer
-  const promise = new Promise((resolve, reject) => {
-    timer = setTimeout(() => reject(new Error('Source capture did not complete')), 60000)
-    port.onmessage = event => {
-      const payload = event.data
-      if (payload === null || typeof payload !== 'object') { reject(new Error('Invalid transfer payload')); return }
-      if (typeof payload.error === 'string') reject(new Error(payload.error))
-      else resolve(payload.snapshot)
-    }
-    port.onmessageerror = () => reject(new Error('Invalid transfer payload'))
-  })
-  return { promise, close() { clearTimeout(timer); port.close() } }
-}
-
 addEventListener('message', async event => {
   if (event.source !== parent || parent === window || event.origin !== reviewerOrigin) return
   const message = event.data
   if (message === null || typeof message !== 'object' || message.channel !== 'preview-state' || !Number.isSafeInteger(message.id)) return
-  const outgoing = (message.operation === 'capture' || message.operation === 'checkpoint') && event.ports?.length === 1 ? event.ports[0] : null
-  let result
+  const transferring = message.operation === 'capture' || message.operation === 'restore'
+  const peer = transferring && event.ports?.length === 1 ? peerChannel(event.ports[0]) : null
+  // Handle errors immediately even while the account check is pending.
+  const incoming = peer?.read(); incoming?.catch(() => {})
   const receivedAt = performance.now()
-  let authorizedAt = null, payloadAt = receivedAt, operationAt = null
-  const transfer = message.operation === 'restore' && event.ports?.length === 1 ? receiveTransfer(event.ports[0]) : null
-  const timing = () => ({ sessionMs: (authorizedAt ?? performance.now()) - receivedAt, payloadWaitMs: payloadAt - receivedAt, operationMs: operationAt === null ? 0 : performance.now() - operationAt })
+  let authorizedAt = null, payloadAt = receivedAt, operationAt = null, operationMs = 0, receiptWaitMs = 0, requestId = null
+  const timing = () => ({ sessionMs: (authorizedAt ?? performance.now()) - receivedAt, payloadWaitMs: payloadAt - receivedAt, operationMs, receiptWaitMs })
   try {
-  const authorization = checkSession().finally(() => { authorizedAt = performance.now() })
-  const incoming = transfer === null ? message.snapshot : transfer.promise.then(value => { payloadAt = performance.now(); return value })
-  const [, payload] = await Promise.all([authorization, incoming])
-  operationAt = performance.now()
-  switch (message.operation) {
-    case 'ready': await firstMount; result = { ready: cells.size > 0, incremental: incremental?.stats() }; break
-    case 'capture': result = capture(); break
-    case 'engine': {
-      if (message.snapshot !== 'full' && message.snapshot !== 'incremental') throw new Error('Invalid comparison engine')
-      incremental?.configure(message.snapshot)
-      result = incremental?.stats() ?? { enabled:false, coverage:false }
-      break
-    }
-    case 'checkpoint': {
-      if (checkpoint === null) throw new Error('No captured checkpoint')
-      result = { ...checkpoint.snapshot, id: checkpoint.id, base: null, references: [] }
-      break
-    }
-    case 'prepare': {
-      const journal = message.snapshot
-      requireSession(journal?.session)
-      if (!Array.isArray(journal?.entries) || !Number.isSafeInteger(journal.index) || journal.index < 0 || journal.index >= journal.entries.length) return
-      const target = journal.entries[journal.index]
-      if (new URL(target.path,location.href).origin!==location.origin) return
-      // Discover the native route owner by its current History API value,
-      // without naming an app module, field, route, or feature.
-      const owners=[]
-      for(const instances of cells.values()) {
-        if(instances.length===1&&instances[0].kind==='state'&&accepts(instances[0].schema,instances[0].read())&&equal(instances[0].read(),history.state))owners.push(instances[0])
+    if (transferring && peer === null) throw Error('Transfer requires a private peer channel')
+    const authorization = checkSession().finally(() => { authorizedAt = performance.now() })
+    let result
+    switch (message.operation) {
+      case 'ready': {
+        await authorization
+        const configuration = message.snapshot
+        if (configuration === null || typeof configuration !== 'object' || typeof configuration.scope !== 'string') throw Error('Missing comparison identity')
+        bridge.configure(configuration.scope, configuration.site)
+        await firstMount
+        result = { ready: cells.size > 0, incremental: bridge.stats() }
+        break
       }
-      if(owners.length!==1||!accepts(owners[0].schema,target.state)){result={navigated:false};break}
-      navigation={entries:structuredClone(journal.entries),index:journal.index}
-      nativeReplace(target.state,'',target.path)
-      // Hidden builds may never receive animation frames. Commit the route
-      // before acknowledging preparation so newly mounted owners are present.
-      flushSync(() => dispatchEvent(new PopStateEvent('popstate',{state:structuredClone(target.state)})))
-      result={navigated:true}
-      break
-    }
-    case 'restore': {
-      const snapshot = payload
-      requireSession(snapshot?.session)
-      if (!Array.isArray(snapshot?.values) || snapshot.values.length > 2000 || !Array.isArray(snapshot.scroll) || !Array.isArray(snapshot.history?.entries)) return
-      if (!Number.isSafeInteger(snapshot.history.index) || snapshot.history.index < 0 || snapshot.history.index >= snapshot.history.entries.length) return
-      for (const entry of snapshot.history.entries) {
-        if (typeof entry.path !== 'string' || new URL(entry.path, location.href).origin !== location.origin) return
+      case 'engine': {
+        await authorization
+        if (message.snapshot !== 'full' && message.snapshot !== 'incremental') throw Error('Invalid comparison engine')
+        bridge.engine(message.snapshot); result = bridge.stats(); break
       }
-      result = restore(snapshot)
-      break
+      case 'capture': {
+        const [, ready] = await Promise.all([authorization, incoming])
+        payloadAt = performance.now()
+        if (ready.kind !== 'offer') throw Error('Expected destination offer')
+        requireSession(ready.session)
+        const transfer = bridge.connection().session
+        const receipt = peer.read(); receipt.catch(() => {})
+        operationAt = performance.now()
+        const context = captureContext()
+        const sent = transfer.send(ready.offer, view(), bridge.observed(), { postMessage(packet) { peer.post({ kind: 'packet', packet, context }) } })
+        requestId = sent.id
+        operationMs = performance.now() - operationAt
+        const waitingAt = performance.now()
+        const reply = await receipt
+        receiptWaitMs = performance.now() - waitingAt
+        if (reply.kind !== 'receipt' || !transfer.acknowledge(reply.receipt)) throw Error('Unexpected transfer receipt')
+        result = { ...sent, captureMs: operationMs, incremental: bridge.stats(), captureDetails: { ...sent.captureDetails, heapBytes: performance.memory?.usedJSHeapSize } }
+        break
+      }
+      case 'restore': {
+        await authorization
+        const transfer = bridge.connection().session
+        const offer = transfer.offer(view(), bridge.observed()); requestId = offer.id
+        peer.post({ kind: 'offer', offer, session })
+        const payload = await incoming; payloadAt = performance.now()
+        if (payload.kind !== 'packet') throw Error('Expected source packet')
+        const context = contextBoundary(payload.context)
+        operationAt = performance.now()
+        const restored = applyPacket(payload.packet, context)
+        operationMs = performance.now() - operationAt
+        peer.post({ kind: 'receipt', receipt: restored.receipt })
+        result = restored.report
+        break
+      }
+      case 'prepare': {
+        await authorization
+        operationAt = performance.now()
+        const journal = message.snapshot
+        requireSession(journal?.session)
+        historyBoundary(journal)
+        const target = journal.entries[journal.index], owners = []
+        for (const instances of cells.values()) {
+          if (instances.length === 1 && instances[0].kind === 'state' && accepts(instances[0].schema, instances[0].read()) && equal(instances[0].read(), history.state)) owners.push(instances[0])
+        }
+        if (owners.length !== 1 || !accepts(owners[0].schema, target.state)) { result = { navigated: false }; break }
+        navigation = { entries: journal.entries, index: journal.index }
+        nativeReplace(target.state, '', target.path)
+        flushSync(() => dispatchEvent(new PopStateEvent('popstate', { state: structuredClone(target.state) })))
+        result = { navigated: true }
+        operationMs = performance.now() - operationAt
+        break
+      }
+      default: await authorization; return
     }
-    default: return
-  }
-  if (outgoing !== null) {
-    const sendingAt = performance.now()
-    outgoing.postMessage({ snapshot: result })
-    result = { skipped: result.skipped, incremental: result.incremental, captureMs: result.captureMs,
-      comparisonMs: result.comparisonMs, captureDetails: { ...result.captureDetails, sendMs: performance.now() - sendingAt } }
-  }
-  parent.postMessage({ channel: 'preview-state', id: message.id, result, timing: timing() }, event.origin)
+    parent.postMessage({ channel: 'preview-state', id: message.id, result, timing: timing() }, event.origin)
   } catch (error) {
-    outgoing?.postMessage({ error: error instanceof Error ? error.message : String(error) })
-    parent.postMessage({ channel: 'preview-state', id: message.id, error: error instanceof Error ? error.message : String(error), timing: timing() }, event.origin)
-  } finally { transfer?.close(); outgoing?.close() }
+    const messageText = error instanceof Error ? error.message : String(error)
+    peer?.error(messageText)
+    parent.postMessage({ channel: 'preview-state', id: message.id, error: messageText, timing: timing() }, event.origin)
+  } finally {
+    if (requestId !== null) bridge.connection().session.cancel(requestId)
+    peer?.close()
+  }
 })

@@ -1,15 +1,14 @@
 import { observeGeneratedFunctions } from './generated-functions'
-import { incrementalCache } from './incremental'
+import { runtimeState } from './transfer/runtime-state'
 import { observeNativeWrites } from './native-writes'
 
 declare const __PREVIEW_COMPLETE__: boolean
 const initializationStarted = performance.now()
-const cache = incrementalCache()
-cache.coverage(__PREVIEW_COMPLETE__)
-const target = globalThis as typeof globalThis & { __previewIncremental: typeof cache; __previewWrites: { touch: typeof cache.touch; unobserved: () => void } }
-target.__previewIncremental = cache
-target.__previewWrites = { touch: cache.touch, unobserved: () => cache.coverage(false) }
-const generated = observeGeneratedFunctions(() => cache.coverage(false))
+const cache = runtimeState(__PREVIEW_COMPLETE__)
+const target = globalThis as typeof globalThis & { __previewTransfer: typeof cache; __previewWrites: { touch: typeof cache.touch; unobserved: () => void } }
+target.__previewTransfer = cache
+target.__previewWrites = { touch: cache.touch, unobserved: cache.unobserved }
+const generated = observeGeneratedFunctions(cache.unobserved)
 observeNativeWrites(cache.touch)
 const initializationMs = performance.now() - initializationStarted
 

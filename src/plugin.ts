@@ -18,14 +18,17 @@ export async function previewPlugin(checkout: string, reviewer: string, options:
     .replace("from 'react'", 'from ' + JSON.stringify(appRequire.resolve('react')))
     .replace("from 'react-dom'", 'from ' + JSON.stringify(appRequire.resolve('react-dom')))
     .replace("from './values'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'values.ts')))
-    .replace("from './checkpoint'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'checkpoint.ts')))
+    .replace(/from '\.\/transfer\/([^']+)'/g, (_, name: string) => 'from ' + JSON.stringify(resolve(import.meta.dir, 'transfer', name + '.ts')))
     .replace("'__PREVIEW_ORIGIN__'", JSON.stringify(origin))
     .replace('const authorizeSession = null', options.sessionModule === undefined ? 'const authorizeSession = null' : 'import { authorizeSession } from ' + JSON.stringify(resolve(options.sessionModule)))
+  const reactCache = (await Bun.file(new URL('./react-cache.js', import.meta.url)).text())
+    .replaceAll("from 'react'", 'from ' + JSON.stringify(appRequire.resolve('react')))
   const plugin: BunPlugin = {
     name: 'preview-state',
     setup(build) {
       build.onResolve({ filter: /^preview-runtime$/ }, () => ({ path: 'runtime', namespace: 'preview' }))
-      build.onLoad({ filter: /.*/, namespace: 'preview' }, () => ({ contents: runtime, loader: 'js', resolveDir: import.meta.dir }))
+      build.onResolve({ filter: /^react$/ }, () => ({ path: 'react-cache', namespace: 'preview' }))
+      build.onLoad({ filter: /.*/, namespace: 'preview' }, ({ path }) => ({ contents: path === 'runtime' ? runtime : reactCache, loader: 'js', resolveDir: import.meta.dir }))
       build.onLoad({ filter: /\.(?:[cm]?[jt]s|[jt]sx)$/ }, async ({ path }) => {
         const observed = sources.get(path)
         // Include app dependencies. Exclude PReview's own graph machinery and

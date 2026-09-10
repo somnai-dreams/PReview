@@ -98,7 +98,7 @@ engine.addEventListener('change', async () => {
     } else status.textContent = engine.value === 'full' ? 'Full checks enabled' : 'Incremental enabled · warm both builds';
   } catch (error) { status.textContent = error.message; } finally { busy = false; engine.disabled = false; }
 });
-let active = 0, sequence = 0, busy = false;
+let active = 0, sequence = 0, namespace = 0, busy = false;
 const pending = new Map();
 for (let index = 0; index < origins.length; index++) {
   const button = document.createElement('button');
@@ -113,7 +113,7 @@ for (let index = 0; index < origins.length; index++) {
   frame.addEventListener('load', async () => {
     button.disabled = true;
     try {
-      const result = await call(index, 'ready');
+      const result = await call(index, 'ready', { scope: session, site: namespace++ });
       if (!result.ready) throw Error('Application has not mounted');
       button.disabled = false;
       capabilities[index] = result.incremental;
@@ -156,7 +156,7 @@ function call(index, operation, snapshot, commands, port) {
     const finish = (error, result, timing) => {
       const roundTripMs = performance.now() - started;
       if (commands !== undefined) commands.push({ build: index, operation, roundTripMs, ...timing,
-        transportAndQueueMs: timing === undefined ? undefined : Math.max(0, roundTripMs - Math.max(timing.sessionMs, timing.payloadWaitMs ?? 0) - timing.operationMs),
+        transportAndQueueMs: timing === undefined ? undefined : Math.max(0, roundTripMs - Math.max(timing.sessionMs, timing.payloadWaitMs ?? 0) - timing.operationMs - (timing.receiptWaitMs ?? 0)),
         error: error?.message });
       if (error !== null) reject(error); else resolve(result);
     };
@@ -186,16 +186,20 @@ async function swap(index) {
     if (preparation.error !== null) throw preparation.error;
     // The parent hands each endpoint directly to a build. Job data is cloned
     // once between the builds and never enters the reviewer's JavaScript heap.
-    async function transfer(operation) {
+    async function transfer() {
       const channel = new MessageChannel();
       const restored = call(index, 'restore', undefined, record.timing.commands, channel.port2);
-      const captured = call(active, operation, undefined, record.timing.commands, channel.port1)
+      const captured = call(active, 'capture', undefined, record.timing.commands, channel.port1)
         .then(metadata => { snapshot = metadata; return metadata; });
       const [, result] = await Promise.all([captured, restored]);
       return result;
     }
-    let result = await transfer('capture');
-    if (result.needsFull) result = await transfer('checkpoint');
+    let result;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      result = await transfer();
+      if (!result.retry) break;
+    }
+    if (result.retry) throw Error('Destination kept changing during transfer; try again');
     record.result = result;
     record.engine = snapshot.incremental?.enabled ? 'incremental' : 'full';
     if (result.rejected.length) {
@@ -223,9 +227,9 @@ async function swap(index) {
       milliseconds: record.milliseconds, rejected: result?.rejected.length, changed: result?.changed?.length, error: record.error });
     if (benchmarkRecords.length > 100) benchmarkRecords.shift();
     window.lastTransfer = record;
-    latestReport = { transfer: { session, sequence: ++transferSequence }, milliseconds: record.milliseconds, engine: record.engine, outcome: record.outcome, error: record.error,
+    latestReport = { transfer: { session, sequence: ++transferSequence }, milliseconds: record.milliseconds, engine: record.engine, outcome: record.outcome, error: record.error ?? result?.error,
       sourceIndex: snapshot?.incremental, destinationIndex: result?.incremental,
-      indexStatistics: 'Current: indexedObjects, roots, pending, enabled, coverage. Other index counters and timings accumulate for the lifetime of each build.',
+      indexStatistics: 'Current: indexedObjects, pending dirty objects, enabled, coverage. Field checks and proof hits accumulate for the lifetime of each build.',
       restored: result?.restored, absent: result?.absent, rejected: result?.rejected, rejectionDetails: result?.rejectionDetails,
       secondPass: result?.secondPass, changed: result?.changed, retained: result?.retained, transferred: result?.transferred,
       keptLocal: { source: snapshot?.skipped, destination: result?.skipped },

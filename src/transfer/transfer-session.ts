@@ -42,6 +42,7 @@ export function transferSession(graph:Graph,scope:string){
   return value
  }
  function send(remote:Offer,view:View,observed:boolean,port:Pick<MessagePort,'postMessage'>){
+  const started=performance.now()
   if(phase.kind!=='idle')throw Error('Transfer already in progress')
   offerBoundary(remote,scope)
   phase={kind:'capturing'}
@@ -56,10 +57,17 @@ export function transferSession(graph:Graph,scope:string){
    // A full wire transfer to a third build can reuse valid source proofs. Lost
    // observation requires fresh validation even if another peer has a base.
    const capture=captureRoots(graph,candidates,!observed)
+   const capturedAt=performance.now()
    for(const i of capture.skipped)skipped.push({id:candidates[i]!.id,reason:'unsupported'})
    const names=capture.indices.map(i=>({id:candidates[i]!.id,kind:candidates[i]!.kind}))
    const id=crypto.randomUUID(),full=!observed||!remote.observed||base===null||base!==remote.base||remote.dirty.some(id=>graph.find(id)===undefined)
-   const sendPort={postMessage(data:Initial|Delta){port.postMessage({scope,offer:remote.id,id,base:full?null:base,names,data} satisfies Packet)}}
+   let sendingAt=capturedAt,sendMs=0,objects=0,references=0
+   const sendPort={postMessage(data:Initial|Delta){
+    objects=data.objects.length;references=data.kind==='delta'?data.references.length:0
+    sendingAt=performance.now()
+    port.postMessage({scope,offer:remote.id,id,base:full?null:base,names,data} satisfies Packet)
+    sendMs=performance.now()-sendingAt
+   }}
    let finish:(accepted:boolean)=>void
    if(full){
     const dirty=new Set(graph.dirty);graph.dirty.clear()
@@ -68,7 +76,8 @@ export function transferSession(graph:Graph,scope:string){
     finish=accepted=>{if(accepted)graph.share();else undo()}
    }else finish=sendDelta(graph,capture,sendPort,remote.dirty).acknowledge
    phase={kind:'sending',id,offer:remote.id,finish}
-   return {id,kind:full?'initial' as const:'delta' as const,skipped}
+   return {id,kind:full?'initial' as const:'delta' as const,skipped,captureMs:performance.now()-started,
+    captureDetails:{validationAndScrollMs:capturedAt-started,encodeMs:sendingAt-capturedAt,sendMs,copiedObjects:full?objects:0,patchedObjects:full?0:objects,reusedObjects:references}}
   }catch(error){base=null;phase={kind:'idle'};throw error}
  }
  function receive<T>(packet:Packet,view:View,observed:boolean,write:ReturnType<typeof nativeWriter>,apply?:(values:RestoredCell[])=>{ok:boolean;result:T;retry?:'full'}){

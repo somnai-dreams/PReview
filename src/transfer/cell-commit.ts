@@ -12,6 +12,7 @@ export type Application = {
   commit(write: () => void): void
   pending(values: RestoredCell[] | null): void
   observed(): boolean
+  afterFirstCommit?(): void
 }
 type Issue = { id: string; reason: 'ambiguous' | 'hook-kind' | 'incoming-type' | 'live-ref' }
 
@@ -55,6 +56,7 @@ export function commitCells(graph: ReturnType<typeof liveProofs>, saved: Restore
     const first = plan(false, new Set())
     if (issues.length > 0) return { ok: false, result: report() }
     apply(first)
+    app.afterFirstCommit?.()
     if (mode === 'observed' && !app.observed()) return { ok: false, retry: 'full' as const, result: { ...report(), reason: 'observation-lost' } }
     // Save affected roots before repairing the bodies: they still need a React
     // refresh even though restoring the data itself makes their values equal.

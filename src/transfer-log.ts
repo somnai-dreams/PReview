@@ -42,7 +42,7 @@ export function parseTransferLog(raw: unknown) {
       if (operation !== 'capture' && operation !== 'checkpoint' && operation !== 'restore' && operation !== 'prepare') throw new Error('Invalid transfer operation')
       if (typeof command['failed'] !== 'boolean') throw new Error('Invalid transfer command outcome')
       return { build: number(command['build'], ids.length - 1, true), operation, failed: command['failed'],
-        ...fields(command, ['roundTripMs', 'sessionMs', 'payloadWaitMs', 'operationMs', 'transportAndQueueMs']) }
+        ...fields(command, ['roundTripMs', 'sessionMs', 'payloadWaitMs', 'operationMs', 'receiptWaitMs', 'transportAndQueueMs']) }
     })
   }
   const timing = object(input['timing'])
