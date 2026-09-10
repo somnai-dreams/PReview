@@ -1,5 +1,5 @@
 import type { Schema, Value } from '../values'
-import { liveProofs, type Entry } from './live-proofs'
+import { liveProofs } from './live-proofs'
 import { container, data, validate, type Proofs } from './validate'
 import type { Capture } from './capture-roots'
 
@@ -44,7 +44,7 @@ function kind(value:object){
 export function receiveInitial(graph:Graph,packet:Initial,roots:Destination[],write:ReturnType<typeof nativeWriter>,preserveInput=false){
  const start=performance.now()
  if(packet.kind!=='initial'||!(packet.ids instanceof Float64Array)||packet.values.length!==roots.length||packet.objects.length!==packet.ids.length)throw Error('Invalid initial packet')
- const incoming=new Map<object,number|Entry>(),sortedIds=packet.ids.slice().sort()
+ const sortedIds=packet.ids.slice().sort()
  // The packet keeps its original object/ID order. A temporary packed index
  // checks uniqueness and reservations without a boxed number Set per object.
  for(let i=0;i<sortedIds.length;i++)if(!graph.acceptsIdentity(sortedIds[i]!)||i>0&&sortedIds[i]===sortedIds[i-1])throw Error('Invalid identity table')
@@ -54,12 +54,7 @@ export function receiveInitial(graph:Graph,packet:Initial,roots:Destination[],wr
   while(low<=high){const middle=Math.floor((low+high)/2),value=sortedIds[middle]!;if(value===id)return true;if(value<id)low=middle+1;else high=middle-1}
   return false
  }
- for(let i=0;i<packet.ids.length;i++){
-  const object=packet.objects[i]!,id=packet.ids[i]!
-  if(!container(object)||incoming.has(object))throw Error('Invalid identity table')
-  incoming.set(object,id)
- }
- const tableAt=performance.now()
+ for(const object of packet.objects)if(!container(object))throw Error('Invalid identity table')
  // Check the existing data, but do not build a second correspondence graph for
  // values that this transfer is about to replace. These proofs last one call.
  const currentData=new WeakMap<object,number>(),currentTypes=new Map<Schema,Map<number,WeakMap<object,number>>>()
@@ -73,20 +68,13 @@ export function receiveInitial(graph:Graph,packet:Initial,roots:Destination[],wr
    values.set(value,height)
   },
  }
- const candidates:unknown[]=[]
- for(const root of roots){
-  const valid=validate(root.kind==='ref'?root.schema:data,root.value,currentProofs)
-  if(!valid&&root.kind==='ref')return {ok:false as const,reason:'destination-type'}
-  candidates.push(valid?root.value:undefined)
- }
- const currentAt=performance.now()
  const claimed=new Set<object>()
- const phase=graph.beginNative(incoming,(source,candidate,id)=>{
+ const phase=graph.beginNative(packet.objects,packet.ids,(source,candidate,id)=>{
   const old=graph.find(id)??candidate
   const owner=container(old)?graph.identity(old):undefined
   const reserved=owner!==undefined&&owner!==id&&hasIdentity(owner)
   let target:object
-  if(container(old)&&currentData.has(old)&&!reserved&&Object.getPrototypeOf(old)===Object.getPrototypeOf(source)&&!claimed.has(old)&&mutable(old))target=old
+  if(container(old)&&currentData.has(old)&&!reserved&&Object.getPrototypeOf(old)===Object.getPrototypeOf(source)&&!claimed.has(old)&&mutable(old)){target=old;claimed.add(old)}
   else if(!preserveInput)target=source
   else switch(Object.getPrototypeOf(source)){
    case Array.prototype:target=[];break
@@ -94,12 +82,22 @@ export function receiveInitial(graph:Graph,packet:Initial,roots:Destination[],wr
    case Set.prototype:target=new Set();break
    default:target={};break
   }
-  claimed.add(target);return target
+  // Only existing candidates can be claimed twice. Every incoming object is
+  // unique, and newly allocated targets are outside the current-data graph.
+  return target
  })
+ const tableAt=performance.now()
  try {
+ const candidates:unknown[]=[]
+ for(const root of roots){
+  const valid=validate(root.kind==='ref'?root.schema:data,root.value,currentProofs)
+  if(!valid&&root.kind==='ref')return {ok:false as const,reason:'destination-type'}
+  candidates.push(valid?root.value:undefined)
+ }
+ const currentAt=performance.now()
  for(let i=0;i<roots.length;i++)if(!phase.accepts(roots[i]!.schema,packet.values[i],candidates[i])){phase.abort();return {ok:false as const,reason:'incoming-type'}}
  const pairs=phase.pairs
- if(pairs.size()!==incoming.size)throw Error('Unreachable identity')
+ if(pairs.size()!==packet.objects.length)throw Error('Unreachable identity')
  const values=packet.values.map(value=>container(value)?pairs.get(value)!.value as Value:value)
  // Pairing is injective and the complete proposed graph passed destination
  // types. No state write has occurred; conflicting IDs still reject here.

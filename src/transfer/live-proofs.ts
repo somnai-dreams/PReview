@@ -20,6 +20,33 @@ export type Entry = {
   typeHeight: number
   shared: boolean
 }
+// Identities are sequential within a replica. Index their low bits directly;
+// hash only occupied blocks, including sparse identities imported from peers.
+// Empty blocks disappear with their last entry, so old namespaces do not keep
+// an ever-growing array alive after roots are released.
+function entryTable(){
+  const width=256,pages=new Map<number,{slots:(Entry|undefined)[];used:number}>()
+  let size=0
+  const get=(id:number)=>pages.get(Math.floor(id/width))?.slots[id%width]
+  return {
+    get,has:(id:number)=>get(id)!==undefined,
+    get size(){return size},
+    set(id:number,entry:Entry){
+      const key=Math.floor(id/width),offset=id%width
+      let page=pages.get(key)
+      if(page===undefined){page={slots:Array.from({length:width},()=>undefined),used:0};pages.set(key,page)}
+      if(page.slots[offset]===undefined){page.used++;size++}
+      page.slots[offset]=entry
+    },
+    delete(id:number){
+      const key=Math.floor(id/width),page=pages.get(key),offset=id%width
+      if(page===undefined||page.slots[offset]===undefined)return
+      page.slots[offset]=undefined;page.used--;size--
+      if(page.used===0)pages.delete(key)
+    },
+    *values(){for(const page of pages.values())for(const entry of page.slots)if(entry!==undefined)yield entry},
+  }
+}
 const count = (children: Children) => children === undefined ? 0 : Array.isArray(children) ? children.length : 1
 const at = (children: Children, index: number): Entry => Array.isArray(children) ? children[index]! : children!
 function addParent(child: Entry, parent: Entry) {
@@ -44,7 +71,8 @@ function removeParent(child: Entry, parent: Entry) {
 export function liveProofs(site: number) {
   const span=4294967296
   if(!Number.isSafeInteger(site)||site<0||site>=2097152)throw Error('Invalid replica namespace')
-  const objects = new WeakMap<object, Entry>(), ids = new Map<number, Entry>(), dirty = new Set<Entry>()
+  const objects = new WeakMap<object, Entry | number>(), ids = entryTable(), dirty = new Set<Entry>()
+  function lookup(value:object){const entry=objects.get(value);return typeof entry==='object'?entry:undefined}
   let next: number = site*span, reads = 0, hits = 0, epoch=0, unshared=0
   let current: Phase | undefined
   let incomingIdentity: ((value:object)=>number|undefined) | undefined
@@ -62,7 +90,7 @@ export function liveProofs(site: number) {
     for(let i=0;i<count(entry.children);i++){const child=at(entry.children,i);removeParent(child,entry);release(child)}
   }
   function get(value: object, proposedId?:number) {
-    const prior=objects.get(value)
+    const prior=lookup(value)
     if(prior!==undefined&&ids.get(prior.id)===prior)return prior
     const incoming=proposedId??incomingIdentity?.(value),id=incoming??next
     if(incoming===undefined&&next>=(site+1)*span)throw Error('Object identities exhausted')
@@ -82,7 +110,7 @@ export function liveProofs(site: number) {
   }
   function touch<T>(value:T):T {
     if(container(value)){
-      const entry=objects.get(value)
+      const entry=lookup(value)
       if(entry!==undefined&&ids.get(entry.id)===entry){beforeWrite?.(entry);epoch++;entry.needsEdges=true;dirty.add(entry);invalidate(entry)}
     }
     return value
@@ -111,17 +139,16 @@ export function liveProofs(site: number) {
   }
   function keep(values:readonly unknown[]){
     const next:Entry[]=[]
-    for(const value of values)if(container(value)){const entry=objects.get(value);if(entry!==undefined&&ids.get(entry.id)===entry){entry.roots++;next.push(entry)}}
+    for(const value of values)if(container(value)){const entry=lookup(value);if(entry!==undefined&&ids.get(entry.id)===entry){entry.roots++;next.push(entry)}}
     for(const root of roots){root.roots--;staged.add(root)}
     roots=next
     for(const entry of staged)release(entry)
     staged.clear()
   }
-  function begin(overrides: ReadonlyMap<object,object> = new Map(), full=false, identities: Pick<ReadonlyMap<object,object>,'get'> = new Map(), identify?: (value:object)=>number|undefined, native?:Pick<Map<object,Entry>,'get'>,pair?:(value:object,candidate:unknown)=>object){
+  function begin(overrides: ReadonlyMap<object,object> = new Map(), full=false, identities: Pick<ReadonlyMap<object,object>,'get'> = new Map(), identify?: (value:object)=>number|undefined,pair?:(value:object,candidate:unknown)=>object){
     if(current!==undefined)throw Error('Another validation phase is open')
     const phase:Phase={status:'pending'},built:Entry[]=[];current=phase;incomingIdentity=identify
     for(const value of overrides.keys()){const entry=get(value);entry.needsEdges=true;invalidate(entry)}
-    const lookup=native===undefined?(value:object)=>objects.get(value):(value:object)=>native.get(value)
     function usable(entry:Entry){
       return entry.validatedRevision===entry.revision&&(entry.phase===phase||!full&&entry.phase.status==='accepted')
     }
@@ -196,28 +223,35 @@ export function liveProofs(site: number) {
     }else if(entry.id!==id){ids.delete(entry.id);entry.id=id;ids.set(id,entry)}
     return entry
   }
-  function beginNative(incoming:Map<object,number|Entry>,choose:(source:object,candidate:unknown,id:number)=>object){
+  function beginNative(sources:object[],identities:Float64Array,choose:(source:object,candidate:unknown,id:number)=>object){
     // A full native clone has no references into an older destination graph.
     // Planning is injective, so validating its original values also validates
     // the eventual destination values. Temporarily bind both identities to the
     // same entry instead of translating every read through two more maps.
-    // Consume each identity slot into its resolved destination. The original
-    // IDs remain in the packet's parallel typed array; no second map is needed.
+    // The graph's object table owns incoming identities too. Adopted native
+    // objects keep their slot; temporary aliases to existing targets are
+    // removed when this phase closes. No parallel source-object map survives.
+    if(current!==undefined)throw Error('Another validation phase is open')
+    let registered=0
+    try{
+      for(const source of sources){if(objects.has(source))throw Error('Duplicate or live native object');objects.set(source,identities[registered]!);registered++}
+    }catch(error){for(let i=0;i<registered;i++)objects.delete(sources[i]!);throw error}
     let paired=0
-    const lookup=(source:object)=>{const value=incoming.get(source);return typeof value==='object'?value:undefined}
-    const phase=begin(new Map(),false,new Map(),undefined,{get:lookup},(source,candidate)=>{
-      const id=incoming.get(source)
+    const phase=begin(new Map(),false,new Map(),undefined,(source,candidate)=>{
+      const id=objects.get(source)
       if(id===undefined)throw Error('Missing identity')
       if(typeof id==='object')return id.value
       const target=choose(source,candidate,id),entry=get(target,ids.has(id)?undefined:id)
-      entry.needsEdges=true;invalidate(entry);incoming.set(source,entry);paired++
+      entry.needsEdges=true;invalidate(entry);objects.set(source,entry);paired++
       return target
     })
-    return {...phase,pairs:{get:lookup,size:()=>paired}}
+    return {...phase,pairs:{get:lookup,size:()=>paired},close(){
+      try{phase.close()}finally{for(const source of sources){const entry=objects.get(source);if(typeof entry==='number'||entry!==undefined&&entry.value!==source)objects.delete(source)}}
+    }}
   }
-  return {get,adopt,find:(id:number)=>ids.get(id)?.value,identity:(value:object)=>objects.get(value)?.id,acceptsIdentity,touch,begin,beginNative,dirty,keep,
+  return {get,adopt,find:(id:number)=>ids.get(id)?.value,identity:(value:object)=>lookup(value)?.id,acceptsIdentity,touch,begin,beginNative,dirty,keep,
     entries:()=>ids.values(),
-    version:(value:unknown)=>container(value)?objects.get(value)?.revision:undefined,
+    version:(value:unknown)=>container(value)?lookup(value)?.revision:undefined,
     ancestors(values:readonly object[]){
       const result=new Set<object>()
       function visit(entry:Entry){
@@ -226,7 +260,7 @@ export function liveProofs(site: number) {
         if(entry.parents instanceof Set)for(const parent of entry.parents)visit(parent)
         else if(entry.parents!==undefined)visit(entry.parents)
       }
-      for(const value of values){const entry=objects.get(value);if(entry!==undefined&&ids.get(entry.id)===entry)visit(entry)}
+      for(const value of values){const entry=lookup(value);if(entry!==undefined&&ids.get(entry.id)===entry)visit(entry)}
       return result
     },
     observeWrites(record:(entry:Entry)=>void){

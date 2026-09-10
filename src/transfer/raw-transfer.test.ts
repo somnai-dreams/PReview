@@ -130,6 +130,32 @@ test('native identity tables need not be ordered and aliases survive reconciliat
  expect(result.values[0]).toBe(target);expect(target.next).toBe(result.values[1]);expect(target).toEqual(source)
  expect(graph.find(3)).toBe(target);expect(graph.find(20)===target.next).toBe(true)
 })
+test('native receive releases provisional identities after rejection and rejects live input aliases',()=>{
+ const graph=liveProofs(1),source={n:1},target:{n:Value}={n:'bad'},schema:Schema={root:0,nodes:[{kind:'object',fields:[{name:'n',shape:1,optional:false}],index:null},{kind:'primitive',name:'number'}]}
+ const packet:Initial={kind:'initial',values:[source],objects:[source],ids:new Float64Array([0])}
+ expect(receiveInitial(graph,packet,[{schema,value:target}],nativeWriter()).ok).toBe(false)
+ expect(graph.stats().objects).toBe(0);expect(graph.identity(source)).toBeUndefined()
+ target.n=0;const result=receiveInitial(graph,packet,[{schema,value:target}],nativeWriter())
+ expect(result.ok).toBe(true);expect(target.n).toBe(1);expect(graph.identity(source)).toBeUndefined()
+ const live:Initial={kind:'initial',values:[target],objects:[target],ids:new Float64Array([0])}
+ expect(()=>receiveInitial(graph,live,[{schema,value:target}],nativeWriter())).toThrow('Duplicate or live native object')
+ expect(graph.identity(target)).toBe(0);expect(graph.accepts(schema,target)).toBe(true)
+ const duplicate:Initial={kind:'initial',values:[source],objects:[source,source],ids:new Float64Array([1,2])}
+ expect(()=>receiveInitial(graph,duplicate,[{schema,value:target}],nativeWriter())).toThrow('Duplicate or live native object')
+ expect(graph.identity(source)).toBeUndefined();expect(graph.identity(target)).toBe(0)
+})
+test('sparse peer identities across block and namespace boundaries are released with their roots',()=>{
+ const graph=liveProofs(1),ids=new Float64Array([Number.MAX_SAFE_INTEGER,256,255,8589934592]),values=Array.from(ids,(id)=>({id}))
+ const packet:Initial={kind:'initial',values,objects:values,ids}
+ const result=receiveInitial(graph,packet,values.map(()=>({schema:data,value:null})),nativeWriter())
+ expect(result.ok).toBe(true);expect(graph.stats().objects).toBe(4)
+ for(let i=0;i<ids.length;i++)expect(graph.find(ids[i]!)).toBe(values[i]!)
+ graph.keep([values[1]])
+ expect(graph.stats().objects).toBe(1);expect(graph.find(256)).toBe(values[1]!)
+ for(const id of [Number.MAX_SAFE_INTEGER,255,8589934592])expect(graph.find(id)).toBeUndefined()
+ graph.clear();expect([...graph.entries()]).toEqual([]);expect(graph.stats().objects).toBe(0)
+ expect(graph.accepts(data,{n:1})).toBe(true);expect(graph.stats().objects).toBe(1)
+})
 
 function sendInitial(graph:ReturnType<typeof liveProofs>,roots:Root[],port:Pick<MessagePort,'postMessage'>){const capture=captureRoots(graph,roots,true);return {ok:capture.skipped.length===0,...postInitial(graph,capture,port)}}
 
