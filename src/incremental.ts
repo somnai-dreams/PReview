@@ -270,7 +270,30 @@ export function incrementalCache() {
       removed(source, target) { conflicts(source, target, -1) },
     }
   }
-  return { touch, begin, keep, phase, clear,
+  // Checkpoint encoding needs paths through owned source data. Its existing
+  // parent links identify the only subtrees that can contain those references;
+  // live-object dirtiness does not change these immutable source edges.
+  function ancestors(sources: Iterable<object>): Set<object> | undefined {
+    // A widely shared object can have more ancestors than a forward search
+    // would visit. Bound this optional work before falling back to that search.
+    const limit = 4096
+    const pending: Link[] = [], seen = new Set<Link>(), values = new Set<object>()
+    for (const source of sources) {
+      const link = sourceLinks.get(source)
+      if (link === undefined) return undefined
+      pending.push(link)
+      if (pending.length > limit) return undefined
+    }
+    for (let index = 0; index < pending.length; index++) {
+      const link = pending[index]!
+      if (seen.has(link)) continue
+      seen.add(link); values.add(link.source)
+      if (pending.length + edgeCount(link.parents) > limit) return undefined
+      for (let parent = 0; parent < edgeCount(link.parents); parent++) pending.push(edgeAt(link.parents, parent))
+    }
+    return values
+  }
+  return { touch, begin, keep, phase, clear, ancestors,
     configure(mode: 'full' | 'incremental') { enabled = mode === 'incremental'; if (!enabled) clear() },
     coverage(complete: boolean) { coverage = complete; if (!complete) clear() },
     stats: () => ({ ...metrics, enabled: enabled && coverage, coverage, roots: roots.length, pending: touched.size }),

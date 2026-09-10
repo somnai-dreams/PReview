@@ -63,3 +63,27 @@ Repair validates replacement refs through already checked, unchanged subgraphs. 
 The same clean-browser 100,000-row workload measured an initial transfer of **4,507 ms**, an unchanged return of **2.1 ms**, a nested edit of **556 ms**, and another return of **1.4 ms**. Collected heap after the initial transfer was **580 MB**; the largest phase sample was **809 MB**. Against the recorded baseline, these observations reduce initial latency by about 51% and the sampled heap maximum by about 34%. Retained heap falls only about 5%, so permanent graph storage remains a limitation. These are individual profiled synthetic runs, with the same limitations described above.
 
 Both frames passed a complete check of every row, tag, metadata value and detail record after the sequence; selection identity stayed shared. A 200-step addition/removal/reordering/alias sequence also passed and released obsolete index entries. Regression checks exercise first-commit effect writes through old aliases, incomplete coverage, rejected capture roots, collection ordering, remount repair and incompatible schemas. Hosted application success still requires the fully loaded real workflow.
+
+## Direct identities and removing reference searches
+
+A subsequent isolated prototype replaced permanent checkpoint copies with weak object identities and coalesced current-object updates. It established the initial correspondence, sent changed objects and destination drift by identity, preserved aliases, and retained writes made after capture for the next transfer. Fourteen mechanism tests passed, including 200 alternating mutation steps, rejection before writes, and collection of obsolete identities. A 300,000-row test transferred a late selection with zero object records and a metadata edit with one record, without traversing the library.
+
+This prototype is not a replacement runtime. It lacks the current engine's declared-type validation, React repair, incomplete-observation fallback and multi-build/session protocol. Its performance is a mechanism result, not an equivalent implementation or a hosted latency claim.
+
+The browser comparison used 100,000 rows with eight detail records per row, or 1,200,002 objects per frame. Each variant ran once in a fresh Chrome process with real MessageChannels, native-write observation and compiled property writes. CPU profiling was disabled. The three roots shared the feed, a selected row, and a wrapper. React, authentication and network traffic were absent; wrapper replacement was explicit and identical across variants. Both frames passed a complete value and alias check after each sequence. Timings below are individual observations in milliseconds, not distribution estimates.
+
+| Work | Existing engine | Direct-identity prototype | Existing engine with ancestor-scoped search |
+| --- | ---: | ---: | ---: |
+| Initial transfer | 4,778 | 5,866 | 4,843 |
+| Select last row | 279 | 0.2 | 15 |
+| Edit last row metadata | 776 | 0.3 | 561 |
+| Replace equal wrapper around feed | 0.4 | 1,251 | 0.6 |
+| Collected heap after initial transfer, decimal MB | 580 | 448 | 580 |
+
+Direct identities eliminated reference-path discovery for small changes. However, normalizing every initial object into wire node/field records raised synchronous message serialization from about 192 to 1,092 ms. Its conservative structural validation then walked all 1.2 million objects to accept one new wrapper. Releasing both application graphs and collecting garbage removed every prototype identity entry. The memory reduction therefore did not depend on retaining old objects indefinitely, but it also did not solve initial-transfer cost.
+
+The usable change takes advantage of information the existing index already owns: parent links in immutable checkpoint data. Encoding computes the ancestors of the objects it needs to reference, then skips unrelated subtrees during path discovery. That temporary set lasts only for the current encoding. It adds no permanent index, changes no wire format, and retains full traversal when correspondence information is unavailable. After this measurement, scope construction was capped at 4,096 queued links so an object shared by thousands of parents cannot cause an unbounded preliminary search; exceeding that bound uses the existing traversal. The large parent array still gets scanned; this is not constant-time lookup. Cold transfer and retained heap remain essentially unchanged in this measurement.
+
+A separate real React fixture with 100,000 rows preserved its selected last-row alias through three nested edits and returns. An effect replaced a derived wrapper after every commit; that remaining difference was reported, and no cells were rejected. Edited switches took 310–377 ms and unchanged returns 9–53 ms. This is a functional smoke check with a different workload, not another before/after benchmark.
+
+The complete direct-identity rewrite remains unshipped. A further prototype should keep the initial graph in an ordinary structured-clone representation and establish correspondence during the required traversal, rather than expand every field into separate wire records. It also needs a validation design that can reuse already established subtree facts across wrapper replacement. Those are explicit unresolved requirements, not reasons to drop type checks or the library's data.

@@ -23,7 +23,7 @@ type Reference = { marker: object; cell: number; path: Step[]; patch?: Patch }
 
 // The marker side table uses object identity, so application data cannot collide
 // with a magic property name. postMessage preserves these identities in its clone.
-export function encodeValues(values: Value[], base: Value[], reusable: Pick<PairMap, 'get'>, previous?: (source: object) => object | undefined, owned = false) {
+export function encodeValues(values: Value[], base: Value[], reusable: Pick<PairMap, 'get'>, previous?: (source: object) => object | undefined, owned = false, ancestors?: (sources: Iterable<object>) => Set<object> | undefined) {
   if (owned && base.length === 0) return { values, references: [], copiedObjects: 0, patchedObjects: 0, reusedObjects: 0 }
   const references: Reference[] = []
   const copies = new Map<object, Value>(), wanted = new Map<object, Reference[]>()
@@ -97,11 +97,14 @@ export function encodeValues(values: Value[], base: Value[], reusable: Pick<Pair
     return target
   }
   const encoded = values.map(encode)
-  // Find paths only for objects actually referenced by changed cells. Most warm
-  // captures need none; no full-graph index is built or retained.
+  // Existing correspondence edges restrict the search to reference ancestors.
+  // Without those edges, the full traversal remains the correctness fallback.
+  // The scope lives only for this encoding; no additional graph index is kept.
+  const scope = wanted.size === 0 ? undefined : ancestors?.(wanted.keys())
   const seen = new Set<object>(), path: Step[] = []
   function visit(value: Value, cell: number) {
     if (wanted.size === 0 || value === null || typeof value !== 'object' || seen.has(value)) return
+    if (scope !== undefined && !scope.has(value)) return
     seen.add(value)
     const references = wanted.get(value)
     if (references !== undefined) { for (const reference of references) { reference.cell = cell; reference.path = path.slice() }; wanted.delete(value) }

@@ -167,7 +167,7 @@ function capture() {
   const changedValues = values.filter(saved => !retained.has(saved.id))
   const baseObjects = checkpoint?.snapshot.values.map(saved => saved.value) ?? []
   const encodingAt = performance.now()
-  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, { get: source => captureCopy.reused(source) ? source : undefined }, construction?.previous, true)
+  const encoded = encodeValues(changedValues.map(saved => saved.value), baseObjects, { get: source => captureCopy.reused(source) ? source : undefined }, construction?.previous, true, incremental?.ancestors)
   const encodedAt = performance.now()
   const snapshot = structuredClone({ skipped, scroll, history: navigation, session })
   snapshot.values = changedValues
