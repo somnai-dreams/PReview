@@ -46,6 +46,18 @@ test('persistent effects are reported and their observed drift remains available
  const result=runner.receive(runner.send().packet)
  expect(result.receipt.outcome).toBe('accepted');expect(result.application?.changed).toEqual(['feed']);expect(old.n).toBe(7);expect(runner.b.dirty.size).toBe(1)
 })
+test('no-op writes in the final React commit do not turn an unchanged library into patches',()=>{
+ const rows=Array.from({length:10000},(_,n)=>({n})),feed=cell('feed','ref',[]),draft=cell('draft','state','')
+ const runner=setup([cell('feed','ref',rows),cell('draft','state','saved')],[feed,draft],pass=>{
+  for(const row of feed.read() as {n:number}[])runner.b.touch(row).n=row.n
+  if(pass===1)draft.reset('reset')
+ })
+ const first=runner.receive(runner.send().packet)
+ expect(first.receipt.outcome).toBe('accepted');expect(first.application?.changed).toEqual([]);expect(runner.counts().commits).toBe(2)
+ expect(runner.b.dirty.size).toBe(0)
+ const next=runner.send();expect(next.sent.kind).toBe('delta');expect(next.sent.captureDetails.patchedObjects).toBe(0)
+ expect(runner.receive(next.packet).receipt.outcome).toBe('accepted');expect(runner.counts().commits).toBe(2)
+})
 test('observation loss during a commit rejects the baseline and closes pending ownership',()=>{
  const target=cell('draft','state',''),runner=setup([cell('draft','state','saved')],[target],()=>runner.loseObservation())
  const result=runner.receive(runner.send().packet)

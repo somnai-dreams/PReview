@@ -31,7 +31,14 @@ export function repairJournal(graph: ReturnType<typeof liveProofs>, roots: Root[
   function changed() {
     if (closed) throw Error('Write journal is closed')
     const changes: Before[] = []
-    for (const item of before.values()) if (!same(item.body, item.entry.value)) changes.push(item)
+    // Observation records attempted writes. Classify them using the existing
+    // before-images on both passes, including the final React commit. A body
+    // restored to its original value needs no wire patch; changed children
+    // retain their own dirty records and still invalidate validation proofs.
+    for (const item of before.values()) {
+      if (!same(item.body, item.entry.value)) changes.push(item)
+      else if (!item.dirty) graph.dirty.delete(item.entry)
+    }
     return changes
   }
   function repair() {
