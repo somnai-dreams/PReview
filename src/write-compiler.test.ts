@@ -172,6 +172,11 @@ test('free receiver getters are read once and lexical receivers keep their origi
     expect(transformed.code).not.toContain('.assignment(')
     new Function('globalThis', transformed.code)(globals)
     expect(events).toEqual(['receiver']); expect(target.value).toBe(3)
+    events.length = 0
+    const method = instrumentWrites('fixture.ts', 'class C { [previewTestReceiver.value = 4](previewTestReceiver) {} }')
+    expect(method.code).not.toContain('.assignment(')
+    new Function('globalThis', method.code)(globals)
+    expect(events).toEqual(['receiver']); expect(target.value).toBe(4)
   } finally { if (descriptor === undefined) Reflect.deleteProperty(globalThis, 'previewTestReceiver'); else Object.defineProperty(globalThis, 'previewTestReceiver', descriptor) }
   let reads = 0, writes = 0
   const receiver = { get value() { reads++; return 3 }, set value(_value: number) { writes++ } }

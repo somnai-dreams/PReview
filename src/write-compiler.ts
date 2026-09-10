@@ -115,7 +115,11 @@ function lexical(identifier: ts.Identifier, source: ts.SourceFile) {
     return ((list.flags & ts.NodeFlags.BlockScoped) !== 0 || functionScope || ts.isExternalModule(source)) && list.declarations.some(item => bound(item.name))
   }
   let functionScope = false
-  for (let parent: ts.Node | undefined = identifier.parent; parent !== undefined; parent = parent.parent) if (ts.isFunctionLike(parent)) { functionScope = true; break }
+  for (let parent: ts.Node | undefined = identifier.parent; parent !== undefined; parent = parent.parent) {
+    // Method names and decorators execute outside the method's parameter scope.
+    if (ts.isComputedPropertyName(parent) || ts.isDecorator(parent)) return false
+    if (ts.isFunctionLike(parent)) functionScope = true
+  }
   for (let parent: ts.Node | undefined = identifier.parent; parent !== undefined; parent = parent.parent) {
     if (ts.isFunctionLike(parent) && parent.parameters.some(item => bound(item.name))) return true
     if (ts.isCatchClause(parent) && parent.variableDeclaration !== undefined && bound(parent.variableDeclaration.name)) return true
