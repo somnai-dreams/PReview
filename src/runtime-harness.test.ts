@@ -31,7 +31,7 @@ export function harness(options: {
     ;({ register(cell) { let list = cells.get(cell.id); if (list === undefined) { list = []; cells.set(cell.id,list) } list.push(cell); markMounted() },
        remove(id) { cells.delete(id) }, mountRef:useObservedRef,mountState:useObservedState,
        pending:()=>pending, history:()=>navigation, context:contextBoundary, push:history.pushState })`, {
-    bridge, __previewTransfer: bridge, runtimeState, accepts, equal, commitCells, crypto, performance, structuredClone, URL, DOMException, setTimeout, clearTimeout,
+    bridge, advanceRenderRevision() {}, accepts, equal, commitCells, crypto, performance, structuredClone, URL, DOMException, setTimeout, clearTimeout,
     parent, window: {}, sessionCheck: options.authorize,
     history: { state: options.historyState ?? null, replaceState(state: unknown, _unused: string, path: string) { histories.push({ state, path }) } },
     getComputedStyle: () => ({overflowY:'auto'}),

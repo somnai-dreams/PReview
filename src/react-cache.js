@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { renderRevision, valueVersion } from 'preview-runtime'
+import { renderRevision, valueVersion } from './react-state'
 export * from 'react'
 
 // Restoring a mutable ref deliberately preserves its identity. React's usual

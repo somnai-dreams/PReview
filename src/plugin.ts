@@ -18,11 +18,13 @@ export async function previewPlugin(checkout: string, reviewer: string, options:
     .replace("from 'react'", 'from ' + JSON.stringify(appRequire.resolve('react')))
     .replace("from 'react-dom'", 'from ' + JSON.stringify(appRequire.resolve('react-dom')))
     .replace("from './values'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'values.ts')))
+    .replace("from './react-state'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'react-state.ts')))
     .replace(/from '\.\/transfer\/([^']+)'/g, (_, name: string) => 'from ' + JSON.stringify(resolve(import.meta.dir, 'transfer', name + '.ts')))
     .replace("'__PREVIEW_ORIGIN__'", JSON.stringify(origin))
     .replace('const authorizeSession = null', options.sessionModule === undefined ? 'const authorizeSession = null' : 'import { authorizeSession } from ' + JSON.stringify(resolve(options.sessionModule)))
   const reactCache = (await Bun.file(new URL('./react-cache.js', import.meta.url)).text())
     .replaceAll("from 'react'", 'from ' + JSON.stringify(appRequire.resolve('react')))
+    .replace("from './react-state'", 'from ' + JSON.stringify(resolve(import.meta.dir, 'react-state.ts')))
   const plugin: BunPlugin = {
     name: 'preview-state',
     setup(build) {

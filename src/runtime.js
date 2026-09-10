@@ -1,7 +1,7 @@
 import { useState, useLayoutEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
 import { accepts, equal } from './values'
-import { runtimeState } from './transfer/runtime-state'
+import { bridge, advanceRenderRevision } from './react-state'
 import { commitCells } from './transfer/cell-commit'
 
 // Replaced by the external bundler for this comparison host.
@@ -21,13 +21,9 @@ function requireSession(saved) {
   if (session === null ? saved !== null : saved === null || saved?.account !== session.account || saved?.environment !== session.environment) throw new Error('Build accounts or environments do not match')
 }
 const cells = new Map()
-const bridge = globalThis.__previewTransfer ?? runtimeState()
 let markMounted
 const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
-let revision = 0
-export function renderRevision() { return revision }
-export function valueVersion(value) { return bridge.version(value) }
 let interacted = false
 for (const type of ['pointerdown','keydown','input']) addEventListener(type,event=>{if(event.isTrusted)interacted=true},{capture:true})
 function publishNavigation() {
@@ -191,7 +187,7 @@ function applyPacket(packet, snapshot) {
   const { graph, session: transfer, writer } = bridge.connection()
   const started = performance.now()
   const restored = transfer.receive(packet, view(), bridge.observed(), writer, values => commitCells(graph, values, {
-    cells: mountedCells, commit(write) { revision++; flushSync(write) }, pending(values) { pending = values }, observed: bridge.observed,
+    cells: mountedCells, commit(write) { advanceRenderRevision(); flushSync(write) }, pending(values) { pending = values }, observed: bridge.observed,
     afterFirstCommit() {
       navigation = snapshot.history
       const target = navigation.entries[navigation.index]
