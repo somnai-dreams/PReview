@@ -5,9 +5,9 @@ import { observeNativeWrites } from './native-writes'
 declare const __PREVIEW_COMPLETE__: boolean
 const initializationStarted = performance.now()
 const cache = runtimeState(__PREVIEW_COMPLETE__)
-const target = globalThis as typeof globalThis & { __previewTransfer: typeof cache; __previewWrites: { touch: typeof cache.touch; unobserved: () => void } }
+const target = globalThis as typeof globalThis & { __previewTransfer: typeof cache; __previewWrites: { touch: typeof cache.touch; assignment: typeof cache.assignment; unobserved: () => void } }
 target.__previewTransfer = cache
-target.__previewWrites = { touch: cache.touch, unobserved: cache.unobserved }
+target.__previewWrites = { touch: cache.touch, assignment: cache.assignment, unobserved: cache.unobserved }
 const generated = observeGeneratedFunctions(cache.unobserved)
 observeNativeWrites(cache.touch)
 const initializationMs = performance.now() - initializationStarted

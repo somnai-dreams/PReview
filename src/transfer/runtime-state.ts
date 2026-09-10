@@ -25,6 +25,7 @@ export function runtimeState(complete = false) {
     configure, connection, observed,
     version: (value: unknown) => current?.graph.version(value),
     touch<T>(value: T): T { return current === null ? value : current.graph.touch(value) },
+    assignment<T>(value: object, key: string, next: T): T { return current === null ? next : current.graph.assignment(value, key, next) },
     unobserved() { complete = false },
     engine(next: 'full' | 'incremental') {
       if (current !== null && current.session.status().phase !== 'idle') throw Error('Transfer already in progress')

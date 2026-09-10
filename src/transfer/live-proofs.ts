@@ -115,6 +115,17 @@ export function liveProofs(site: number) {
     }
     return value
   }
+  function assignment<T>(value: object, key: string, next: T): T {
+    // The original JS assignment still executes. Only an unchanged own data
+    // property avoids invalidation; additions, accessors and changed values
+    // retain the ordinary before-write path and its repair journal.
+    const entry = lookup(value)
+    if (entry !== undefined && ids.get(entry.id) === entry) {
+      const field = Object.getOwnPropertyDescriptor(value, key)
+      if (field === undefined || !('value' in field) || !Object.is(field.value, next)) touch(value)
+    }
+    return next
+  }
   function detachChildren(entry:Entry){
     const old=entry.children;entry.children=undefined
     for(let i=0;i<count(old);i++){const child=at(old,i);removeParent(child,entry);staged.add(child)}
@@ -249,7 +260,7 @@ export function liveProofs(site: number) {
       try{phase.close()}finally{for(const source of sources){const entry=objects.get(source);if(typeof entry==='number'||entry!==undefined&&entry.value!==source)objects.delete(source)}}
     }}
   }
-  return {get,adopt,find:(id:number)=>ids.get(id)?.value,identity:(value:object)=>lookup(value)?.id,acceptsIdentity,touch,begin,beginNative,dirty,keep,
+  return {get,adopt,find:(id:number)=>ids.get(id)?.value,identity:(value:object)=>lookup(value)?.id,acceptsIdentity,touch,assignment,begin,beginNative,dirty,keep,
     entries:()=>ids.values(),
     version:(value:unknown)=>container(value)?lookup(value)?.revision:undefined,
     ancestors(values:readonly object[]){
