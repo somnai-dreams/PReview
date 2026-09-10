@@ -49,7 +49,7 @@ test('renderer-first CommonJS entry can restore state in a minified production b
     const replies: {result?: {rejected: string[]}; error?: string}[] = []
     const parent = {postMessage(reply: typeof replies[number]) { replies.push(reply) }}
     const context = {
-      parent, window: {}, performance, structuredClone, URL, DOMException, crypto, setTimeout, clearTimeout,
+      parent, window: {}, performance, structuredClone, Float64Array, URL, DOMException, crypto, setTimeout, clearTimeout,
       document: {querySelectorAll:()=>[]},
       flushed: false, history: { state: 'home', replaceState() {} },
       location: {pathname:'/',search:'',hash:'',origin:'https://build.example',href:'https://build.example/'},

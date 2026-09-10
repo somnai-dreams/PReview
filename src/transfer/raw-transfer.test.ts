@@ -111,6 +111,25 @@ test('a peer cannot reserve a future local object identity',()=>{
  expect(target.n).toBe(0)
  expect(graph.accepts(data,target)).toBe(true);expect(graph.get(target).id).toBe(4294967296)
 })
+test('native identity validation rejects malformed tables before touching destination values',()=>{
+ const first={n:1},second={n:2}
+ for(const ids of [[0,0],[0,NaN],[0,Infinity],[0,-1],[0,0.5]]){
+  const graph=liveProofs(1),target=[{n:0}]
+  expect(()=>receiveInitial(graph,{kind:'initial',values:[first,second],objects:[first,second],ids:new Float64Array(ids)},target.concat({n:0}).map(value=>({schema:data,value})),nativeWriter())).toThrow('Invalid identity table')
+  expect(target).toEqual([{n:0}]);expect(graph.stats().objects).toBe(0)
+ }
+ const graph=liveProofs(1),target={n:0}
+ expect(()=>receiveInitial(graph,{kind:'initial',values:[first],objects:[first,second],ids:new Float64Array([3,1])},[{schema:data,value:target}],nativeWriter())).toThrow('Unreachable identity')
+ expect(target.n).toBe(0)
+})
+test('native identity tables need not be ordered and aliases survive reconciliation',()=>{
+ const graph=liveProofs(1),other={n:2},source={n:1,next:other}
+ const target:{n:number;next?:Value}={n:0}
+ const result=receiveInitial(graph,{kind:'initial',values:[source,other],objects:[other,source],ids:new Float64Array([20,3])},[{schema:data,value:target},{schema:data,value:null}],nativeWriter())
+ expect(result.ok).toBe(true);if(!result.ok)throw Error(result.reason)
+ expect(result.values[0]).toBe(target);expect(target.next).toBe(result.values[1]);expect(target).toEqual(source)
+ expect(graph.find(3)).toBe(target);expect(graph.find(20)===target.next).toBe(true)
+})
 
 function sendInitial(graph:ReturnType<typeof liveProofs>,roots:Root[],port:Pick<MessagePort,'postMessage'>){const capture=captureRoots(graph,roots,true);return {ok:capture.skipped.length===0,...postInitial(graph,capture,port)}}
 

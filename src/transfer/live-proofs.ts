@@ -196,20 +196,24 @@ export function liveProofs(site: number) {
     }else if(entry.id!==id){ids.delete(entry.id);entry.id=id;ids.set(id,entry)}
     return entry
   }
-  function beginNative(incoming:ReadonlyMap<object,number>,choose:(source:object,candidate:unknown,id:number)=>object){
+  function beginNative(incoming:Map<object,number|Entry>,choose:(source:object,candidate:unknown,id:number)=>object){
     // A full native clone has no references into an older destination graph.
     // Planning is injective, so validating its original values also validates
     // the eventual destination values. Temporarily bind both identities to the
     // same entry instead of translating every read through two more maps.
-    const aliases=new Map<object,Entry>()
-    const phase=begin(new Map(),false,new Map(),undefined,aliases,(source,candidate)=>{
-      const prior=aliases.get(source);if(prior!==undefined)return prior.value
-      const id=incoming.get(source);if(id===undefined)throw Error('Missing identity')
+    // Consume each identity slot into its resolved destination. The original
+    // IDs remain in the packet's parallel typed array; no second map is needed.
+    let paired=0
+    const lookup=(source:object)=>{const value=incoming.get(source);return typeof value==='object'?value:undefined}
+    const phase=begin(new Map(),false,new Map(),undefined,{get:lookup},(source,candidate)=>{
+      const id=incoming.get(source)
+      if(id===undefined)throw Error('Missing identity')
+      if(typeof id==='object')return id.value
       const target=choose(source,candidate,id),entry=get(target,ids.has(id)?undefined:id)
-      entry.needsEdges=true;invalidate(entry);aliases.set(source,entry)
+      entry.needsEdges=true;invalidate(entry);incoming.set(source,entry);paired++
       return target
     })
-    return {...phase,pairs:aliases}
+    return {...phase,pairs:{get:lookup,size:()=>paired}}
   }
   return {get,adopt,find:(id:number)=>ids.get(id)?.value,identity:(value:object)=>objects.get(value)?.id,acceptsIdentity,touch,begin,beginNative,dirty,keep,
     entries:()=>ids.values(),
