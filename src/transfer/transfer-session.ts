@@ -60,7 +60,12 @@ export function transferSession(graph:Graph,scope:string){
    const capturedAt=performance.now()
    for(const i of capture.skipped)skipped.push({id:candidates[i]!.id,reason:'unsupported'})
    const names=capture.indices.map(i=>({id:candidates[i]!.id,kind:candidates[i]!.kind}))
-   const id=crypto.randomUUID(),full=!observed||!remote.observed||base===null||base!==remote.base||remote.dirty.some(id=>graph.find(id)===undefined)
+   // A bulk load after a small first switch is not a small delta. Encoding it
+   // would construct another JS graph and index both receiver graphs at once.
+   // This upper bound is constant-time; small deltas keep their ordinary path.
+   const stats=graph.stats(),bodies=stats.unshared+stats.dirty+remote.dirty.length
+   const bulk=bodies>4096&&bodies>stats.objects/2
+   const id=crypto.randomUUID(),full=bulk||!observed||!remote.observed||base===null||base!==remote.base||remote.dirty.some(id=>graph.find(id)===undefined)
    let sendingAt=capturedAt,sendMs=0,objects=0,references=0
    const sendPort={postMessage(data:Initial|Delta){
     objects=data.objects.length;references=data.kind==='delta'?data.references.length:0

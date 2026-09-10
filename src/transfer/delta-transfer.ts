@@ -44,7 +44,7 @@ export function sendDelta(graph:Graph,capture:Capture,port:Pick<MessagePort,'pos
   try{port.postMessage(packet)}catch(error){for(const entry of dirty)graph.dirty.add(entry);throw error}
   let acknowledged=false
   return {objects:packet.objects.length,references:packet.references.length,
-   acknowledge(ok:boolean){if(acknowledged)throw Error('Already acknowledged');acknowledged=true;if(ok)for(const entry of sent)entry.shared=true;else for(const entry of dirty)graph.dirty.add(entry)},
+   acknowledge(ok:boolean){if(acknowledged)throw Error('Already acknowledged');acknowledged=true;if(ok)for(const entry of sent)graph.shareEntry(entry);else for(const entry of dirty)graph.dirty.add(entry)},
   }
 }
 
@@ -121,7 +121,7 @@ export function receiveDelta(graph:Graph,packet:Delta,roots:Destination[],write:
     else{for(const key of Object.keys(target))if(!Object.hasOwn(source,key))write.erase(target,key);for(const key of Object.keys(source))write.define(target,key,translate(Object.getOwnPropertyDescriptor(source,key)!.value))}
    }
   })
-  for(const[source,target]of pairs){const entry=graph.adopt(target,incoming.get(source)!);entry.shared=true;graph.dirty.delete(entry)}
+  for(const[source,target]of pairs){const entry=graph.adopt(target,incoming.get(source)!);graph.shareEntry(entry);graph.dirty.delete(entry)}
   graph.keep(values)
   return {ok:true as const,values,objects:pairs.size}
  }finally{phase.close()}

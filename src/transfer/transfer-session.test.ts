@@ -181,3 +181,26 @@ test('unobserved structural edits rebuild ownership before collecting a full ide
  const target=b.state.value as typeof root;expect(target.rows).toEqual([{n:1},{n:2}]);expect(target.other).toBe(target.rows[1]!)
  root.rows.splice(0,1);transfer(a,b);expect(a.graph.stats().objects).toBe(3)
 })
+
+test('bulk growth and replacement use the native graph while a later small edit stays incremental',()=>{
+ const rows=[{n:0}],a=replica(0,rows),b=replica(1,[{n:9}]);transfer(a,b)
+ a.graph.touch(rows);for(let n=1;n<5000;n++)rows.push({n})
+ const grown=transfer(a,b);expect(grown.sent.kind).toBe('initial');expect(b.state.value).toEqual(rows)
+ expect(a.graph.stats().unshared).toBe(0);expect(b.graph.stats().unshared).toBe(0)
+ a.graph.touch(rows[4999]!).n=42
+ const edit=transfer(a,b);expect(edit.sent.kind).toBe('delta');expect(edit.packet.data.objects).toHaveLength(1);expect(b.state.value).toEqual(rows)
+ a.state.value=Array.from({length:5000},(_,n)=>({n:n+1}))
+ const replacement=transfer(a,b);expect(replacement.sent.kind).toBe('initial');expect(b.state.value).toEqual(a.state.value)
+ expect(a.graph.stats().unshared).toBe(0);expect(b.graph.stats().unshared).toBe(0)
+})
+
+test('unshared counts survive rejected serialization, pruning and readonly replacement',()=>{
+ const graph=liveProofs(0),old=Object.freeze({n:1}),root={old};graph.accepts(data,root);expect(graph.stats().unshared).toBe(2);graph.share()
+ const replacement={n:1};graph.adopt(replacement,graph.identity(old)!,true);expect(graph.stats().unshared).toBe(2)
+ graph.keep([replacement]);expect(graph.stats().objects).toBe(1);expect(graph.stats().unshared).toBe(1);graph.share();graph.clear();expect(graph.stats().unshared).toBe(0)
+ const a=replica(0,[{n:0}]),b=replica(1,[]);transfer(a,b)
+ a.state.value=Array.from({length:5000},(_,n)=>({n}));const offer=b.session.offer(b.view(),true)
+ expect(()=>a.session.send(offer,a.view(),true,{postMessage(){throw Error('closed')}})).toThrow('closed')
+ expect(a.graph.stats().unshared).toBe(5001);b.session.cancel(offer.id)
+ expect(transfer(a,b).sent.kind).toBe('initial');expect(a.graph.stats().unshared).toBe(0)
+})

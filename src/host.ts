@@ -128,18 +128,6 @@ for (let index = 0; index < origins.length; index++) {
   document.body.append(frame);
   frames.push(frame);
 }
-const preparations = frames.map(() => ({ promise: Promise.resolve(), error: null, commands: [] }));
-addEventListener('message', event => {
-  if (event.data?.channel !== 'preview-navigation') return;
-  const index = frames.findIndex(frame => frame.contentWindow === event.source);
-  if (index !== active || event.origin !== origins[index]) return;
-  for (let target = 0; target < frames.length; target++) {
-    if (target === index) continue;
-    const preparation = { promise: null, error: null, commands: [] };
-    preparation.promise = call(target, 'prepare', event.data.history, preparation.commands).then(result => { preparation.error = result.navigated ? null : Error('Destination could not follow this route'); }, error => { preparation.error = error; });
-    preparations[target] = preparation;
-  }
-});
 addEventListener('message', event => {
   const message = event.data;
   if (message?.channel !== 'preview-state') return;
@@ -173,17 +161,10 @@ async function swap(index) {
   busy = true; engine.disabled = true;
   const started = performance.now();
   const record = { source: active, destination: index, engine: engine.value, outcome: 'error', result: null, error: null, milliseconds: 0,
-    timing: { routeWaitMs: 0, commands: [], presentationMs: 0 } };
+    timing: { routeWaitMs: 0, routePreparation: [], commands: [], presentationMs: 0 } };
   let snapshot = null;
   status.textContent = 'Transferring…';
   try {
-    const preparation = preparations[index];
-    await preparation.promise;
-    record.timing.routeWaitMs = performance.now() - started;
-    // Preparation can precede the click. Only routeWaitMs belongs in the switch
-    // total; its command timings explain the work that was already in flight.
-    record.timing.routePreparation = preparation.commands;
-    if (preparation.error !== null) throw preparation.error;
     // The parent hands each endpoint directly to a build. Job data is cloned
     // once between the builds and never enters the reviewer's JavaScript heap.
     async function transfer() {

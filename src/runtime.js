@@ -1,6 +1,6 @@
 import { useState, useLayoutEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
-import { accepts, equal } from './values'
+import { accepts } from './values'
 import { bridge, advanceRenderRevision } from './react-state'
 import { commitCells } from './transfer/cell-commit'
 
@@ -24,12 +24,6 @@ const cells = new Map()
 let markMounted
 const firstMount = new Promise(resolve => { markMounted = resolve })
 let pending = null
-let interacted = false
-for (const type of ['pointerdown','keydown','input']) addEventListener(type,event=>{if(event.isTrusted)interacted=true},{capture:true})
-function publishNavigation() {
-  if (interacted && parent !== window) parent.postMessage({channel:'preview-navigation',history:{...structuredClone(navigation),session}},reviewerOrigin)
-}
-
 // An iframe's native session history is joint with every sibling iframe.
 // Keep native push/replace/back semantics local to each instrumented build.
 const nativeReplace = history.replaceState.bind(history)
@@ -45,13 +39,11 @@ history.pushState = (state, unused, url) => {
   navigation.entries.splice(navigation.index + 1)
   navigation.entries.push(next)
   navigation.index++
-  publishNavigation()
 }
 history.replaceState = (state, unused, url) => {
   const next = entry(state, url)
   nativeReplace(next.state, unused, next.path)
   navigation.entries[navigation.index] = next
-  publishNavigation()
 }
 history.go = (delta = 0) => {
   if (delta === 0) { location.reload(); return }
@@ -61,7 +53,6 @@ history.go = (delta = 0) => {
   const target = navigation.entries[index]
   nativeReplace(target.state, '', target.path)
   dispatchEvent(new PopStateEvent('popstate', { state: structuredClone(target.state) }))
-  publishNavigation()
 }
 history.back = () => history.go(-1)
 history.forward = () => history.go(1)
@@ -300,24 +291,6 @@ addEventListener('message', async event => {
         operationMs = performance.now() - operationAt
         peer.post({ kind: 'receipt', receipt: restored.receipt })
         result = restored.report
-        break
-      }
-      case 'prepare': {
-        await authorization
-        operationAt = performance.now()
-        const journal = message.snapshot
-        requireSession(journal?.session)
-        historyBoundary(journal)
-        const target = journal.entries[journal.index], owners = []
-        for (const instances of cells.values()) {
-          if (instances.length === 1 && instances[0].kind === 'state' && accepts(instances[0].schema, instances[0].read()) && equal(instances[0].read(), history.state)) owners.push(instances[0])
-        }
-        if (owners.length !== 1 || !accepts(owners[0].schema, target.state)) { result = { navigated: false }; break }
-        navigation = { entries: journal.entries, index: journal.index }
-        nativeReplace(target.state, '', target.path)
-        flushSync(() => dispatchEvent(new PopStateEvent('popstate', { state: structuredClone(target.state) })))
-        result = { navigated: true }
-        operationMs = performance.now() - operationAt
         break
       }
       default: await authorization; return

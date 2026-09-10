@@ -45,17 +45,19 @@ export function liveProofs(site: number) {
   const span=4294967296
   if(!Number.isSafeInteger(site)||site<0||site>=2097152)throw Error('Invalid replica namespace')
   const objects = new WeakMap<object, Entry>(), ids = new Map<number, Entry>(), dirty = new Set<Entry>()
-  let next: number = site*span, reads = 0, hits = 0, epoch=0
+  let next: number = site*span, reads = 0, hits = 0, epoch=0, unshared=0
   let current: Phase | undefined
   let incomingIdentity: ((value:object)=>number|undefined) | undefined
   let roots: Entry[] = []
   let beforeWrite: ((entry:Entry)=>void) | undefined
   const staged = new Set<Entry>()
   const empty: Phase = {status:'rejected'}
+  function shareEntry(entry:Entry){if(!entry.shared&&ids.get(entry.id)===entry){entry.shared=true;unshared--}}
   function acceptsIdentity(id:number){return Number.isSafeInteger(id)&&id>=0&&(Math.floor(id/span)!==site||id<next)}
   function release(entry: Entry) {
     if (entry.roots!==0 || entry.parents!==undefined || ids.get(entry.id) !== entry) return
     ids.delete(entry.id);dirty.delete(entry)
+    if(!entry.shared)unshared--
     objects.delete(entry.value)
     for(let i=0;i<count(entry.children);i++){const child=at(entry.children,i);removeParent(child,entry);release(child)}
   }
@@ -68,7 +70,7 @@ export function liveProofs(site: number) {
     if(ids.has(id))throw Error('Conflicting object identity')
     const entry:Entry={id,value,roots:0,revision:0,validatedRevision:-1,needsEdges:true,parents:undefined,children:undefined,phase:empty,dataHeight:0,schema:undefined,shape:0,typeHeight:0,shared:false}
     if(incoming===undefined)next++
-    objects.set(value,entry);ids.set(entry.id,entry);staged.add(entry)
+    objects.set(value,entry);ids.set(entry.id,entry);staged.add(entry);unshared++
     return entry
   }
   function invalidate(entry:Entry) {
@@ -188,6 +190,7 @@ export function liveProofs(site: number) {
       // its existing entry into the replacement's unused local identity; this
       // preserves ownership until keep() releases its old roots and parents.
       // Replacing ids[id] alone would orphan those dependency edges.
+      if(occupied.shared)unshared++
       occupied.id=entry.id;occupied.shared=false;ids.set(occupied.id,occupied)
       entry.id=id;ids.set(id,entry)
     }else if(entry.id!==id){ids.delete(entry.id);entry.id=id;ids.set(id,entry)}
@@ -228,8 +231,9 @@ export function liveProofs(site: number) {
       return ()=>{if(beforeWrite!==record)throw Error('Write journal already closed');beforeWrite=undefined}
     },
     revision:()=>epoch,
-    share(){for(const entry of ids.values())entry.shared=true},
-    stats:()=>({objects:ids.size,dirty:dirty.size,reads,hits}),
+    shareEntry,
+    share(){for(const entry of ids.values())shareEntry(entry)},
+    stats:()=>({objects:ids.size,dirty:dirty.size,unshared,reads,hits}),
     clear(){keep([])},
     accepts(schema:Schema,value:unknown){const phase=begin();try{const valid=phase.accepts(schema,value);if(valid){phase.commit();keep([...roots.map(entry=>entry.value),value])}else phase.abort();return valid}finally{phase.close()}},
     data,
