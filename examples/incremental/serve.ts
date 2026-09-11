@@ -18,7 +18,7 @@ for (const [index, build] of builds.entries()) Bun.serve({ hostname: 'localhost'
   switch (url.pathname) {
     case '/preload.js': return new Response(preload?.outputs[0] ?? '')
     case '/app.js': return new Response(build.outputs[0])
-    default: return new Response('<!doctype html><title>Incremental comparison</title>' + (fast ? '<script>performance.mark("preview-preload-start")</script><script src="/preload.js"></script>' : '') + '<div id="root"></div><script type="module" src="/app.js"></script>', { headers:{'content-type':'text/html'} })
+    default: return new Response('<!doctype html><title>Incremental comparison</title>' + (fast ? '<script src="/preload.js"></script>' : '') + '<div id="root"></div><script type="module" src="/app.js"></script>', { headers:{'content-type':'text/html'} })
   }
 } })
 startReviewer({ port, builds: [{ url:'http://localhost:' + (port + 1), label:'Build A' }, { url:'http://localhost:' + (port + 2), label:'Build B' }] })

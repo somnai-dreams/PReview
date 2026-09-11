@@ -4,10 +4,10 @@ import { incrementalCache } from './incremental'
 import { comparison } from './values'
 import { instrumentWrites } from './write-compiler'
 
-const bridge = globalThis as typeof globalThis & { __previewWrites?: { touch: ReturnType<typeof incrementalCache>['touch']; unobserved: () => void } }
+const bridge = globalThis as typeof globalThis & { __previewWrites?: { touch: ReturnType<typeof incrementalCache>['touch']; assignment: <T>(value: object, key: string, next: T) => T; unobserved: () => void } }
 function observe<T>(run: (cache: ReturnType<typeof incrementalCache>, generated: ReturnType<typeof observeGeneratedFunctions>) => T): T {
   const cache = incrementalCache(), previous = Object.getOwnPropertyDescriptor(bridge, '__previewWrites')
-  bridge.__previewWrites = { touch: cache.touch, unobserved: () => cache.coverage(false) }
+  bridge.__previewWrites = { touch: cache.touch, assignment(value, key, next) { cache.touch(value, "property", key); return next }, unobserved: () => cache.coverage(false) }
   const generated = observeGeneratedFunctions(() => cache.coverage(false))
   try { return run(cache, generated) } finally {
     generated.stop()
@@ -64,7 +64,7 @@ test('coercion and newTarget prototype lookup happen once; syntax errors remain 
 test('async and generator constructors are covered through their prototype aliases', async () => {
   // Await inside the scope explicitly so patched constructors are restored last.
   const cache = incrementalCache(), previous = Object.getOwnPropertyDescriptor(bridge, '__previewWrites')
-  bridge.__previewWrites = { touch: cache.touch, unobserved: () => cache.coverage(false) }
+  bridge.__previewWrites = { touch: cache.touch, assignment(value, key, next) { cache.touch(value, "property", key); return next }, unobserved: () => cache.coverage(false) }
   const generated = observeGeneratedFunctions(() => cache.coverage(false))
   try {
     const target = {count:1}, matches = watch(cache, target)

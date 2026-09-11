@@ -53,4 +53,21 @@ The example now has a button that mutates an old row alias inside a runtime-gene
 
 Reusing the existing TypeScript parser adds a roughly 4.2 MB minified preload, served without compression by this local fixture. Fetching, parsing and evaluating that preload took 191.6 ms and 122.4 ms in the two frames. Generating the small closure took 3.3 ms and 3.2 ms, including both native construction and instrumentation. The diagnostic panel reports cumulative generated-code compilation time and total browser heap when available. Total heap includes the application, checkpoints, retained indexes and transient allocations; it does not isolate parser overhead. A controlled retained-heap measurement is still missing. The parser is retained, but individual generated source strings and ASTs are not kept in a cache.
 
-Launchers place a `preview-preload-start` performance mark immediately before loading the preload. This makes the displayed preload duration include its fetch, parse and evaluation rather than only timing the module body after parsing.
+These measurements used an external performance mark before loading the preload. The current diagnostic reports `initializationMs` for observer setup within the module body; it excludes fetch and parse time and needs no launcher-supplied mark.
+
+## Changed-subgraph reproduction (9 September 2026)
+
+A temporary version of this React example used 100,000 rows (about 300,000 objects per frame), each with nested metadata and tags, a selected-row alias, and an effect that replaces a derived ref after every commit. Both versions used real compiler/native write observation, including restoration writes. Each ran in a fresh Chrome process. After an initial transfer and return, three nested flag edits were transferred with a return between each edit.
+
+| Observation | Before subgraph patches | With subgraph patches |
+| --- | --- | --- |
+| Edited switches | 2,254 / 2,347 / 2,212 ms | 466 / 469 / 440 ms |
+| Returns without an edit | 111–130 ms | 34–50 ms |
+| Initial transfer | 1,842 ms | 2,335 ms |
+| Retained JS heap after collection | 166 MB | 218 MB |
+
+The edited-switch median fell about 79%. Each edited capture used four container patches and copied zero complete objects. The selected row retained shared identity; no cell was rejected. The deliberately effect-reset derived ref remained reported as changed after repair in both versions. Heap measurements cover the test page's JavaScript isolate after the same sequence and forced collection; they are not peak RSS or per-frame allocation measurements.
+
+This is a small synthetic comparison, not a hosted latency guarantee. It exposes the tradeoff: finer correspondence and validation reuse consume more retained memory and did not improve the first transfer. New data still needs copying and validation, and patching a large array still requires scanning/shallow-copying its entries. A separate 200-step data-level sequence checked nested edits, reordered collections, equal replacements and changing aliases across alternating transfers without retaining obsolete index nodes.
+
+A subsequent index-only Chrome probe used the same 100,000 rows and 300,001 indexed objects in separate fresh browser processes. Keeping single parent/child links directly, and allocating lists only for branching, reduced collected JavaScript heap from 84,245,296 to 47,473,336 bytes. These totals include identical live and checkpoint data, not just the index. This isolates index representation; it does not replace the full runtime or hosted measurements above. The shared-parent tests and 200-step alternating mutation sequence still pass.

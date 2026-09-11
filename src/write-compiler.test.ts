@@ -10,6 +10,7 @@ function watched<T extends object>(value: T) {
   cache.keep([{ source, target: value }])
   return {
     touch: cache.touch,
+    assignment<T>(value: object, key: string, next: T) { cache.touch(value, "property", key); return next },
     matches: () => comparison(undefined, cache.phase()).matches(source, value),
     reset() { source = structuredClone(value); cache.keep([{ source, target: value }]) },
   }
@@ -138,4 +139,47 @@ test('ordinary constructor calls preserve receiver evaluation and field markers'
   const target = {count: 1, constructor() { events.push('receiver'); return this }}
   expect(run(target)).toBe(3)
   expect(events).toEqual(['receiver', 'property:count'])
+})
+
+test('ordinary assignments retain native evaluation across rebinding, defaults and rejected writes', async () => {
+  const calls: object[] = [], tracking = { touch<T>(value: T) { if (typeof value === 'object' && value !== null) calls.push(value); return value }, assignment<T>(value: object, _key: string, next: T) { calls.push(value); return next } }
+  const cases = [
+    'return x => { const old = x; const result = x.value = (x = {value: 2}, 7); return [old.value, x.value, result] }',
+    'return x => { [x.value = 9] = [3]; ({v:x.other = 7} = {v:8}); return x }',
+    'return x => { const result = x.value = (x.other = 4, 3); return [x, result] }',
+    'return x => { x.value = undefined; return Object.hasOwn(x, "value") }',
+    'return x => { let calls = 0; try { null.value = ++calls } catch {} return calls }',
+  ]
+  for (const source of cases) {
+    const a: Record<string, unknown> = {}, b = {}, original = new Function(source)() as (value: object) => unknown
+    calls.length = 0
+    expect(compiled(source, tracking)(a)).toEqual(original(b)); expect(a).toEqual(b)
+    if (source.includes('[x.value')) expect(calls).toEqual([a, a])
+  }
+  const source = 'return async x => { const old = x; const result = x.value = await (x = {value:2}, Promise.resolve(7)); return [old.value, x.value, result] }'
+  const original = new Function(source)() as (value: object) => Promise<unknown>
+  expect(await compiled(source, tracking)({})).toEqual(await original({}))
+  const strict = new Function('globalThis', instrumentWrites('fixture.ts', '"use strict"; return x => x.value = 3').code)({__previewWrites: tracking}) as (value: object) => unknown
+  expect(() => strict(Object.freeze({value: 3}))).toThrow(TypeError)
+})
+
+test('free receiver getters are read once and lexical receivers keep their original setter', () => {
+  const events: string[] = [], target = { value: 0 }, globals = { __previewWrites: { touch<T>(value: T) { return value }, assignment<T>(_value: object, _key: string, next: T) { return next } } }
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'previewTestReceiver')
+  Object.defineProperty(globalThis, 'previewTestReceiver', {configurable: true, get() { events.push('receiver'); return target }})
+  try {
+    const transformed = instrumentWrites('fixture.ts', 'previewTestReceiver.value = 3')
+    expect(transformed.code).not.toContain('.assignment(')
+    new Function('globalThis', transformed.code)(globals)
+    expect(events).toEqual(['receiver']); expect(target.value).toBe(3)
+    events.length = 0
+    const method = instrumentWrites('fixture.ts', 'class C { [previewTestReceiver.value = 4](previewTestReceiver) {} }')
+    expect(method.code).not.toContain('.assignment(')
+    new Function('globalThis', method.code)(globals)
+    expect(events).toEqual(['receiver']); expect(target.value).toBe(4)
+  } finally { if (descriptor === undefined) Reflect.deleteProperty(globalThis, 'previewTestReceiver'); else Object.defineProperty(globalThis, 'previewTestReceiver', descriptor) }
+  let reads = 0, writes = 0
+  const receiver = { get value() { reads++; return 3 }, set value(_value: number) { writes++ } }
+  expect(compiled('return x => x.value = 3', globals.__previewWrites)(receiver)).toBe(3)
+  expect(reads).toBe(0); expect(writes).toBe(1)
 })
