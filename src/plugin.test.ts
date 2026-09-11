@@ -67,3 +67,30 @@ test('renderer-first CommonJS entry can restore state in a minified production b
     expect(context.flushed).toBe(true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
+
+test('bundles an optional runtime extension without instrumenting its own writes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'preview-extension-'))
+  const previous = process.env['PREVIEW_INCREMENTAL']
+  try {
+    process.env['PREVIEW_INCREMENTAL'] = '1'
+    await mkdir(join(root, 'src'))
+    await mkdir(join(root, 'extension'))
+    await Bun.write(join(root, 'package.json'), '{}')
+    await Bun.write(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true }, include: ['src'] }))
+    for (const name of ['react', 'react-dom']) {
+      await mkdir(join(root, 'node_modules', name), { recursive: true })
+      await Bun.write(join(root, 'node_modules', name, 'package.json'), JSON.stringify({ name, main: 'index.js' }))
+      await Bun.write(join(root, 'node_modules', name, 'index.js'), name === 'react' ? 'export function useState(){}; export function useRef(){}; export function useLayoutEffect(){}' : 'export function flushSync(f){f()}')
+    }
+    const entry = join(root, 'src/index.ts'), extension = join(root, 'extension/index.js')
+    await Bun.write(entry, "import { useObservedState } from 'preview-runtime'; console.log(useObservedState)")
+    await Bun.write(extension, 'export function createExtension(runtime){ const audit = {}; audit.extensionMarker = runtime.history; return {supports:()=>false} }')
+    const { plugin } = await previewPlugin(root, 'https://review.example', { runtimeExtension: extension })
+    const result = await Bun.build({ entrypoints: [entry], plugins: [plugin], target: 'browser' })
+    expect(result.success).toBe(true)
+    expect(await result.outputs[0]!.text()).toContain('audit.extensionMarker = runtime.history')
+  } finally {
+    if (previous === undefined) delete process.env['PREVIEW_INCREMENTAL']; else process.env['PREVIEW_INCREMENTAL'] = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})

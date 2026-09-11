@@ -15,6 +15,7 @@ export function cell(id: string, kind: 'state' | 'ref', initial: unknown, schema
 }
 let namespace = 0
 export function harness(options: {
+  extension?: (runtime: unknown) => object
   observed?: boolean
   authorize?: () => Promise<{account:string;environment:string}>
   afterCommit?: (pass: number) => void
@@ -27,12 +28,12 @@ export function harness(options: {
   type Event = { source: object; origin: string; data: object; ports: MessagePort[] }
   let receive!: (event: Event) => Promise<void>
   const parent = { postMessage(message: Reply) { replies.push(message) } }
-  const runtime = runInNewContext(source.replace('const authorizeSession = null', options.authorize === undefined ? 'const authorizeSession = null' : 'const authorizeSession = sessionCheck') + `
+  const runtime = runInNewContext(source.replace('const createExtension = null', options.extension === undefined ? 'const createExtension = null' : 'const createExtension = extensionFactory').replace('const authorizeSession = null', options.authorize === undefined ? 'const authorizeSession = null' : 'const authorizeSession = sessionCheck') + `
     ;({ register(cell) { let list = cells.get(cell.id); if (list === undefined) { list = []; cells.set(cell.id,list) } list.push(cell); markMounted() },
        remove(id) { cells.delete(id) }, mountRef:useObservedRef,mountState:useObservedState,
        pending:()=>pending, history:()=>navigation, context:contextBoundary, push:history.pushState })`, {
     bridge, advanceRenderRevision() {}, accepts, equal, commitCells, crypto, performance, structuredClone, URL, DOMException, setTimeout, clearTimeout,
-    parent, window: {}, sessionCheck: options.authorize,
+    parent, window: {}, sessionCheck: options.authorize, extensionFactory: options.extension,
     history: { state: options.historyState ?? null, replaceState(state: unknown, _unused: string, path: string) { histories.push({ state, path }) } },
     getComputedStyle: () => ({overflowY:'auto'}),
     PopStateEvent: class { state: unknown; constructor(_type:string, options:{state:unknown}){this.state=options.state} },

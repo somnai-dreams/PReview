@@ -9,6 +9,7 @@ const reviewerOrigin = '__PREVIEW_ORIGIN__'
 // A deployment may supply an account/environment check. It must reject stale
 // page sessions; credentials never enter the checkpoint or parent frame.
 const authorizeSession = null
+const createExtension = null
 let session = null
 async function checkSession() {
   if (authorizeSession === null) return
@@ -112,6 +113,7 @@ export function useObservedRef(id, schema, initial) {
 }
 function mountedCells() { return [...cells.values()].flat() }
 function view() { return mountedCells().map(cell => ({ id: cell.id, kind: cell.kind, schema: cell.schema, value: cell.read(), owner: cell })) }
+const extension = createExtension === null ? null : createExtension({ view, mountedCells, bridge, history: () => navigation, commit(write) { advanceRenderRevision(); flushSync(write) } })
 function captureContext() {
   const scroll = []
   const elements = [...document.querySelectorAll('[id]')]
@@ -233,7 +235,7 @@ addEventListener('message', async event => {
   if (event.source !== parent || parent === window || event.origin !== reviewerOrigin) return
   const message = event.data
   if (message === null || typeof message !== 'object' || message.channel !== 'preview-state' || !Number.isSafeInteger(message.id)) return
-  const transferring = message.operation === 'capture' || message.operation === 'restore'
+  const transferring = message.operation === 'capture' || message.operation === 'restore' || extension?.transferring(message.operation) === true
   const peer = transferring && event.ports?.length === 1 ? peerChannel(event.ports[0]) : null
   // Handle errors immediately even while the account check is pending.
   const incoming = peer?.read(); incoming?.catch(() => {})
@@ -244,7 +246,10 @@ addEventListener('message', async event => {
     if (transferring && peer === null) throw Error('Transfer requires a private peer channel')
     const authorization = checkSession().finally(() => { authorizedAt = performance.now() })
     let result
-    switch (message.operation) {
+    if (extension?.supports(message.operation)) {
+      await authorization
+      result = await extension.run(message.operation, { snapshot: message.snapshot, peer, incoming, session })
+    } else switch (message.operation) {
       case 'ready': {
         await authorization
         const configuration = message.snapshot
