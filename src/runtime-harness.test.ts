@@ -22,6 +22,7 @@ export function harness(options: {
   document?: object
   historyState?: unknown
   onPopState?: (state: unknown) => void
+  navigation?: { history: () => { entries: { path: string; state: unknown }[]; index: number }; restore: (journal: { entries: { path: string; state: unknown }[]; index: number }) => void }
 } = {}) {
   const bridge = runtimeState(options.observed ?? true), replies: Reply[] = [], histories: unknown[] = []
   let commits = 0, sequence = 0
@@ -34,6 +35,7 @@ export function harness(options: {
        pending:()=>pending, history:()=>navigation, context:contextBoundary, push:history.pushState })`, {
     bridge, advanceRenderRevision() {}, accepts, equal, commitCells, crypto, performance, structuredClone, URL, DOMException, setTimeout, clearTimeout,
     parent, window: {}, sessionCheck: options.authorize, extensionFactory: options.extension,
+    __previewNavigation: options.navigation,
     history: { state: options.historyState ?? null, replaceState(state: unknown, _unused: string, path: string) { histories.push({ state, path }) } },
     getComputedStyle: () => ({overflowY:'auto'}),
     PopStateEvent: class { state: unknown; constructor(_type:string, options:{state:unknown}){this.state=options.state} },

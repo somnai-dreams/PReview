@@ -2,6 +2,18 @@ import { expect, test } from 'bun:test'
 import { cell, data, harness, transfer, journal } from './runtime-harness.test'
 import type { Value } from './values'
 
+test('state transfer uses the installed navigation owner instead of a second journal', async () => {
+  const saved = { entries: [{ path: '/detail', state: { returnTo: '/list' } }], index: 0 }
+  let restored: unknown = null
+  const a = harness({ navigation: { history: () => saved, restore() { throw Error('Source must not restore') } } })
+  const b = harness({ navigation: { history: () => journal, restore(value) { restored = value } } })
+  a.runtime.register(cell('draft', 'state', 'saved'))
+  b.runtime.register(cell('draft', 'state', 'original'))
+  expect((await transfer(a, b)).report.rejected).toEqual([])
+  expect(restored).toEqual(saved)
+  expect(b.histories).toEqual([])
+})
+
 test('actual runtime restores named cells, repairs mounts, and sends aliases directly between frames', async () => {
   const row = { title: 'saved' }, source = harness(), feed = cell('feed','ref',[]), draft = cell('draft','state',''), selected = cell('selected','state',null), child = cell('child','state','')
   const target = harness({ afterCommit(pass) { if (pass === 1) { draft.reset('effect'); selected.reset({title:'saved'}); target.runtime.register(child) } } })

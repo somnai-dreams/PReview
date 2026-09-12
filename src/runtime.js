@@ -29,11 +29,14 @@ let pending = null
 // Keep native push/replace/back semantics local to each instrumented build.
 const nativeReplace = history.replaceState.bind(history)
 let navigation = { entries: [{ state: history.state, path: location.pathname + location.search + location.hash }], index: 0 }
+const externalNavigation = globalThis.__previewNavigation ?? null
+const currentNavigation = () => externalNavigation === null ? navigation : externalNavigation.history()
 function entry(state, url) {
   const target = new URL(url ?? location.href, location.href)
   if (target.origin !== location.origin) throw new DOMException('Cross-origin history URL', 'SecurityError')
   return { state: structuredClone(state), path: target.pathname + target.search + target.hash }
 }
+if (externalNavigation === null) {
 history.pushState = (state, unused, url) => {
   const next = entry(state, url)
   nativeReplace(next.state, unused, next.path)
@@ -57,6 +60,7 @@ history.go = (delta = 0) => {
 }
 history.back = () => history.go(-1)
 history.forward = () => history.go(1)
+}
 
 
 function observe(cell) {
@@ -113,7 +117,7 @@ export function useObservedRef(id, schema, initial) {
 }
 function mountedCells() { return [...cells.values()].flat() }
 function view() { return mountedCells().map(cell => ({ id: cell.id, kind: cell.kind, schema: cell.schema, value: cell.read(), owner: cell })) }
-const extension = createExtension === null ? null : createExtension({ view, mountedCells, bridge, history: () => navigation, commit(write) { advanceRenderRevision(); flushSync(write) } })
+const extension = createExtension === null ? null : createExtension({ view, mountedCells, bridge, history: currentNavigation, commit(write) { advanceRenderRevision(); flushSync(write) } })
 function captureContext() {
   const scroll = []
   const elements = [...document.querySelectorAll('[id]')]
@@ -132,7 +136,7 @@ function captureContext() {
     }
     scroll.push({ id: element.id, top: element.scrollTop, left: element.scrollLeft, anchor })
   }
-  return { scroll, history: navigation, session }
+  return { scroll, history: currentNavigation(), session }
 }
 function historyBoundary(journal) {
   if (journal === null || typeof journal !== 'object' || !Array.isArray(journal.entries) || journal.entries.length === 0 || !Number.isSafeInteger(journal.index) || journal.index < 0 || journal.index >= journal.entries.length) throw Error('Invalid navigation history')
@@ -182,6 +186,7 @@ function applyPacket(packet, snapshot) {
   const restored = transfer.receive(packet, view(), bridge.observed(), writer, values => commitCells(graph, values, {
     cells: mountedCells, commit(write) { advanceRenderRevision(); flushSync(write) }, pending(values) { pending = values }, observed: bridge.observed,
     afterFirstCommit() {
+      if (externalNavigation !== null) { externalNavigation.restore(snapshot.history); return }
       navigation = snapshot.history
       const target = navigation.entries[navigation.index]
       nativeReplace(target.state, '', target.path)
